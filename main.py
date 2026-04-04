@@ -3,8 +3,8 @@ SaaS backend: ИНН → реквизиты компании (DaData).
 
 Публичное API: POST /company-by-inn (заголовок X-API-KEY).
 
-Вариант C (без виджета amo): POST /integrations/amo/webhook — вебхук из автоматизации amo
-с телом {"lead_id": <id>}; нужны AMOCRM_API_BASE, AMOCRM_ACCESS_TOKEN, DADATA_API_KEY,
+Вариант C (без виджета amo): POST /integrations/amo/webhook — JSON с lead_id или типовой
+формат вебхука amo (leads.add и т.д.); нужны AMOCRM_API_BASE, AMOCRM_ACCESS_TOKEN, DADATA_API_KEY,
 поле ИНН на сделке (AMO_FIELD_INN или значение по умолчанию в коде).
 
 Деплой на Render:
@@ -15,6 +15,7 @@ SaaS backend: ИНН → реквизиты компании (DaData).
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 from datetime import datetime, timezone
@@ -118,16 +119,43 @@ def _dadata_row_to_amo_lead_cfv(row: dict[str, str]) -> list[dict[str, Any]]:
 
 
 def _inn_from_lead_payload(lead: dict[str, Any], field_id: int) -> str:
-    for block in lead.get("custom_fields_values") or []:
-        if int(block.get("field_id") or 0) != field_id:
+    cfv = lead.get("custom_fields_values")
+    if not isinstance(cfv, list):
+        return ""
+    for block in cfv:
+        if not isinstance(block, dict):
+            continue
+        try:
+            fid = int(block.get("field_id") or 0)
+        except (TypeError, ValueError):
+            continue
+        if fid != field_id:
             continue
         for v in block.get("values") or []:
+            if not isinstance(v, dict):
+                continue
             raw = v.get("value")
             if raw is None:
                 continue
             digits = "".join(c for c in str(raw) if c.isdigit())
             return digits
     return ""
+
+
+def _normalize_amo_single_lead_json(raw: Any) -> dict[str, Any] | None:
+    """GET /api/v4/leads/{id} обычно отдаёт объект сделки; иногда обёртка _embedded.leads."""
+    if isinstance(raw, list) and raw and isinstance(raw[0], dict):
+        return raw[0]
+    if not isinstance(raw, dict):
+        return None
+    if "custom_fields_values" in raw or "id" in raw:
+        return raw
+    emb = raw.get("_embedded")
+    if isinstance(emb, dict):
+        leads = emb.get("leads")
+        if isinstance(leads, list) and leads and isinstance(leads[0], dict):
+            return leads[0]
+    return raw
 
 # Список API-ключей клиентов (лимиты и учёт вызовов)
 API_KEYS: dict[str, dict[str, int]] = {
@@ -234,14 +262,72 @@ class InnBody(BaseModel):
         return s
 
 
-class AmoWebhookBody(BaseModel):
-    """Тело для POST /integrations/amo/webhook (автоматизация amo: «Отправить вебхук»)."""
+def _parse_positive_int_id(v: Any) -> int | None:
+    if v is None:
+        return None
+    if isinstance(v, bool):
+        return None
+    if isinstance(v, int) and v > 0:
+        return v
+    if isinstance(v, str) and v.strip().isdigit():
+        n = int(v.strip())
+        return n if n > 0 else None
+    return None
 
-    lead_id: int = Field(..., gt=0, description="ID сделки в amo")
-    secret: str | None = Field(
-        default=None,
-        description="Если задан AMO_WEBHOOK_SECRET — тот же текст здесь или в заголовке X-Webhook-Secret",
-    )
+
+def _lead_id_from_leads_sublist(block: Any) -> int | None:
+    if not isinstance(block, list) or not block:
+        return None
+    first = block[0]
+    if isinstance(first, dict):
+        return _parse_positive_int_id(first.get("id"))
+    return None
+
+
+def extract_lead_id_from_amo_webhook_payload(data: Any) -> int | None:
+    """
+    ID сделки: кастомный JSON {"lead_id": N} или типовой вебхук amo
+    (leads.add / update / delete / status — первый элемент).
+    """
+    if not isinstance(data, dict):
+        return None
+    for key in ("lead_id", "id", "leadId"):
+        lid = _parse_positive_int_id(data.get(key))
+        if lid is not None:
+            return lid
+    leads = data.get("leads")
+    if isinstance(leads, dict):
+        for sub in ("add", "update", "delete", "status"):
+            lid = _lead_id_from_leads_sublist(leads.get(sub))
+            if lid is not None:
+                return lid
+    return None
+
+
+def extract_secret_from_amo_webhook_payload(data: Any) -> str | None:
+    if not isinstance(data, dict):
+        return None
+    s = data.get("secret")
+    if s is None:
+        return None
+    return str(s)
+
+
+def _parse_amo_webhook_json_body(raw: bytes, content_type: str) -> Any | None:
+    if not raw or not raw.strip():
+        return {}
+    text = raw.decode("utf-8", errors="replace").strip()
+    if not text:
+        return {}
+    ct = (content_type or "").lower()
+    if "application/json" not in ct and not text.startswith(("{", "[")):
+        logger.warning("amo webhook: не JSON (Content-Type=%s, первые символы не {/[)", content_type)
+        return None
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError as e:
+        logger.warning("amo webhook: ошибка JSON: %s", e)
+        return None
 
 
 def get_dadata_token() -> str:
@@ -391,7 +477,13 @@ async def _party_company_for_inn(request: Request, inn: str) -> dict[str, str] |
     if not suggestions:
         return None
 
-    first = suggestions[0].get("data") or {}
+    zeroth = suggestions[0]
+    if not isinstance(zeroth, dict):
+        logger.error("DaData find_by_id: первый элемент не объект")
+        return None
+    first = zeroth.get("data") or {}
+    if not isinstance(first, dict):
+        first = {}
     company = party_to_company(first)
     CACHE[inn] = company
     return company
@@ -431,16 +523,52 @@ def _check_amo_webhook_secret(
 
 @app.post("/integrations/amo/webhook")
 async def amo_sync_lead_webhook(
-    body: AmoWebhookBody,
     request: Request,
     x_webhook_secret: Annotated[str | None, Header(alias="X-Webhook-Secret")] = None,
 ):
     """
-    Вариант C: без виджета. В amo — действие «Отправить вебхук» на этот URL,
-    JSON: {"lead_id": {{lead.id}}, "secret": "..."} (secret — если задан AMO_WEBHOOK_SECRET).
-    Читает ИНН из поля сделки (AMO_FIELD_INN), тянет DaData, PATCH сделки в amo.
+    Вариант C: без виджета. URL для автоматизации amo «Отправить вебхук».
+
+    Тело JSON (любой подходящий вариант):
+      - {"lead_id": <id>} или {"id": <id>} — кастомный шаблон;
+      - типовой вебхук amo с вложением leads.add[0].id / update / status и т.д.
+
+    Если задан AMO_WEBHOOK_SECRET — передайте тот же текст в JSON \"secret\" или в заголовке X-Webhook-Secret.
     """
-    _check_amo_webhook_secret(body.secret, x_webhook_secret)
+    raw = await request.body()
+    ct = request.headers.get("content-type", "")
+    data = _parse_amo_webhook_json_body(raw, ct)
+    if data is None:
+        return JSONResponse(
+            status_code=200,
+            content={
+                "ok": False,
+                "reason": "INVALID_JSON",
+                "hint": "Нужен POST с Content-Type: application/json и телом JSON",
+            },
+        )
+
+    lead_id = extract_lead_id_from_amo_webhook_payload(data)
+    body_secret = extract_secret_from_amo_webhook_payload(data)
+
+    logger.info(
+        "amo webhook: bytes=%s lead_id=%s top_keys=%s",
+        len(raw),
+        lead_id,
+        list(data.keys()) if isinstance(data, dict) else type(data).__name__,
+    )
+
+    _check_amo_webhook_secret(body_secret, x_webhook_secret)
+
+    if lead_id is None:
+        return JSONResponse(
+            status_code=200,
+            content={
+                "ok": False,
+                "reason": "NO_LEAD_ID",
+                "hint": "Добавьте в JSON lead_id или используйте шаблон с {{lead.id}} в поле lead_id",
+            },
+        )
 
     amo: httpx.AsyncClient | None = getattr(request.app.state, "amo_http", None)
     if amo is None:
@@ -456,49 +584,62 @@ async def amo_sync_lead_webhook(
     get_dadata_token()
 
     try:
-        lr = await amo.get(f"/api/v4/leads/{body.lead_id}")
+        lr = await amo.get(f"/api/v4/leads/{lead_id}")
         lr.raise_for_status()
     except httpx.HTTPStatusError as e:
-        logger.warning("amo GET lead %s: %s", body.lead_id, e)
+        logger.warning("amo GET lead %s: %s", lead_id, e)
         raise HTTPException(status_code=502, detail="Не удалось прочитать сделку в amo") from e
     except httpx.RequestError as e:
         logger.exception("amo недоступен: %s", e)
         raise HTTPException(status_code=502, detail="Ошибка сети при обращении к amo") from e
 
-    lead = lr.json()
+    try:
+        lead_raw = lr.json()
+    except json.JSONDecodeError as e:
+        logger.warning("amo GET lead %s: ответ не JSON: %s", lead_id, e)
+        raise HTTPException(
+            status_code=502,
+            detail="amo вернул не JSON (проверьте AMOCRM_API_BASE и токен)",
+        ) from e
+
+    lead = _normalize_amo_single_lead_json(lead_raw)
+    if lead is None:
+        logger.warning("amo GET lead %s: неожиданная форма ответа %s", lead_id, type(lead_raw).__name__)
+        raise HTTPException(status_code=502, detail="Неожиданный ответ amo при чтении сделки")
+
     inn = _inn_from_lead_payload(lead, inn_fid)
     if len(inn) not in (10, 12):
         return JSONResponse(
             status_code=200,
-            content={"ok": False, "reason": "BAD_INN", "lead_id": body.lead_id, "inn_digits": inn},
+            content={"ok": False, "reason": "BAD_INN", "lead_id": lead_id, "inn_digits": inn},
         )
 
     company = await _party_company_for_inn(request, inn)
     if company is None:
         return JSONResponse(
             status_code=200,
-            content={"ok": False, "reason": "NOT_FOUND", "lead_id": body.lead_id, "inn": inn},
+            content={"ok": False, "reason": "NOT_FOUND", "lead_id": lead_id, "inn": inn},
         )
 
     cfv = _dadata_row_to_amo_lead_cfv(company)
     if not cfv:
         return JSONResponse(
             status_code=200,
-            content={"ok": False, "reason": "NO_MAPPED_FIELDS", "lead_id": body.lead_id},
+            content={"ok": False, "reason": "NO_MAPPED_FIELDS", "lead_id": lead_id},
         )
 
-    patch_body = [{"id": body.lead_id, "custom_fields_values": cfv}]
+    patch_body = [{"id": lead_id, "custom_fields_values": cfv}]
     try:
         pr = await amo.patch("/api/v4/leads", json=patch_body)
         pr.raise_for_status()
     except httpx.HTTPStatusError as e:
-        logger.warning("amo PATCH lead %s: %s %s", body.lead_id, e, e.response.text[:500] if e.response else "")
+        logger.warning("amo PATCH lead %s: %s %s", lead_id, e, e.response.text[:500] if e.response else "")
         raise HTTPException(status_code=502, detail="Не удалось обновить сделку в amo") from e
     except httpx.RequestError as e:
         logger.exception("amo недоступен при PATCH: %s", e)
         raise HTTPException(status_code=502, detail="Ошибка сети при обновлении amo") from e
 
-    return {"ok": True, "lead_id": body.lead_id, "inn": inn, "fields_updated": len(cfv)}
+    return {"ok": True, "lead_id": lead_id, "inn": inn, "fields_updated": len(cfv)}
 
 
 if __name__ == "__main__":
