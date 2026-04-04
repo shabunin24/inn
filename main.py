@@ -82,6 +82,12 @@ def _amo_non_json_error_detail(response: httpx.Response) -> str:
     ct = (response.headers.get("content-type") or "").lower()
     body = (response.text or "")[:400].lower()
     st = response.status_code
+    if st == 204 or not (response.text or "").strip():
+        return (
+            f"amo вернул пустой ответ (HTTP {st}) для GET сделки. "
+            "Сервер повторяет запрос через filter[id][]; если ошибка остаётся — проверьте id сделки, "
+            "токен и доступ интеграции к сделкам."
+        )
     base = (
         f"amo вернул не JSON (HTTP {st}). Проверьте AMOCRM_API_BASE и долгосрочный токен "
         f"из той же интеграции и аккаунта, что и сделки (например https://shabuninaleksei.amocrm.ru)."
@@ -93,6 +99,8 @@ def _amo_non_json_error_detail(response: httpx.Response) -> str:
             "вокруг значения AMOCRM_ACCESS_TOKEN на Render)."
         )
     return base
+
+
 AMOCRM_CLIENT_ID = os.environ.get("AMOCRM_CLIENT_ID", "").strip()
 AMOCRM_CLIENT_SECRET = os.environ.get("AMOCRM_CLIENT_SECRET", "").strip()
 # Вебхук (вариант C): если задан — проверяем телом secret= или заголовок X-Webhook-Secret
@@ -188,6 +196,51 @@ def _normalize_amo_single_lead_json(raw: Any) -> dict[str, Any] | None:
         if isinstance(leads, list) and leads and isinstance(leads[0], dict):
             return leads[0]
     return raw
+
+
+async def _amo_fetch_lead_raw(amo: httpx.AsyncClient, lead_id: int) -> dict[str, Any]:
+    """
+    GET /api/v4/leads/{id}. У части аккаунтов amo отвечает 204 без тела — тогда
+    GET /api/v4/leads?filter[id][]=id&limit=1.
+    """
+    lr = await amo.get(f"/api/v4/leads/{lead_id}")
+    lr.raise_for_status()
+
+    lead_raw: dict[str, Any] | None = None
+    if lr.status_code != 204 and (lr.text or "").strip():
+        try:
+            parsed = lr.json()
+            if isinstance(parsed, dict):
+                lead_raw = parsed
+        except json.JSONDecodeError:
+            logger.warning("amo GET /api/v4/leads/%s: тело не JSON", lead_id)
+
+    if lead_raw is None:
+        logger.info("amo GET /api/v4/leads/%s: пусто или не JSON → filter[id][]", lead_id)
+        lr2 = await amo.get(
+            "/api/v4/leads",
+            params=[("filter[id][]", str(lead_id)), ("limit", "1")],
+        )
+        lr2.raise_for_status()
+        if lr2.status_code == 204 or not (lr2.text or "").strip():
+            raise HTTPException(
+                status_code=502,
+                detail=(
+                    f"amo вернул пустой ответ для сделки {lead_id} (и по filter[id][]). "
+                    "Проверьте id, поддомен и права интеграции на сделки."
+                ),
+            )
+        try:
+            parsed2 = lr2.json()
+        except json.JSONDecodeError as e:
+            logger.warning("amo GET leads filter: не JSON: %s", e)
+            raise HTTPException(status_code=502, detail=_amo_non_json_error_detail(lr2)) from e
+        if not isinstance(parsed2, dict):
+            raise HTTPException(status_code=502, detail="Неожиданный ответ amo при чтении сделки")
+        lead_raw = parsed2
+
+    return lead_raw
+
 
 # Список API-ключей клиентов (лимиты и учёт вызовов)
 API_KEYS: dict[str, dict[str, int]] = {
@@ -663,8 +716,7 @@ async def amo_sync_lead_webhook(
     get_dadata_token()
 
     try:
-        lr = await amo.get(f"/api/v4/leads/{lead_id}")
-        lr.raise_for_status()
+        lead_raw = await _amo_fetch_lead_raw(amo, lead_id)
     except httpx.HTTPStatusError as e:
         if e.response is not None and 300 <= e.response.status_code < 400:
             loc = e.response.headers.get("location", "")[:200]
@@ -681,20 +733,6 @@ async def amo_sync_lead_webhook(
     except httpx.RequestError as e:
         logger.exception("amo недоступен: %s", e)
         raise HTTPException(status_code=502, detail="Ошибка сети при обращении к amo") from e
-
-    try:
-        lead_raw = lr.json()
-    except json.JSONDecodeError as e:
-        prefix = (lr.text or "")[:120].replace("\n", " ")
-        logger.warning(
-            "amo GET lead %s: не JSON status=%s ct=%s err=%s prefix=%r",
-            lead_id,
-            lr.status_code,
-            lr.headers.get("content-type"),
-            e,
-            prefix,
-        )
-        raise HTTPException(status_code=502, detail=_amo_non_json_error_detail(lr)) from e
 
     lead = _normalize_amo_single_lead_json(lead_raw)
     if lead is None:
