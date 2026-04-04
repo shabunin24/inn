@@ -150,6 +150,10 @@ define(['jquery'], function ($) {
     suggestState.seq += 1;
     var mySeq = suggestState.seq;
     var base = String(settings.backend_url).trim().replace(/\/+$/, '');
+    var Ls = function (k, fb) {
+      return tr(self, k, fb);
+    };
+    var $msg = $('.js-inn-dadata-msg');
     fetch(base + '/suggest-party', {
       method: 'POST',
       headers: {
@@ -159,21 +163,50 @@ define(['jquery'], function ($) {
       body: JSON.stringify({ query: q }),
     })
       .then(function (res) {
-        return res.json().then(function (body) {
-          return { ok: res.ok, body: body };
-        });
+        return res
+          .json()
+          .catch(function () {
+            return {};
+          })
+          .then(function (body) {
+            return { ok: res.ok, status: res.status, body: body };
+          });
       })
       .then(function (r) {
         if (mySeq !== suggestState.seq) return;
         if (!r.ok) {
           hideSuggestDropdown();
+          var hint = '';
+          if (r.status === 404) {
+            hint = Ls(
+              'err_suggest_404',
+              'Сервер отвечает 404 на /suggest-party — задеплойте актуальный main на Render и заново залейте script.js виджета в amo.',
+            );
+          } else if (r.status === 403) {
+            hint = Ls('err_suggest_403', 'Проверьте X-API-KEY в настройках виджета.');
+          } else if (r.status === 503) {
+            hint = Ls('err_suggest_503', 'На сервере не настроен DADATA_API_KEY.');
+          } else {
+            hint = Ls('err_suggest', 'Подсказки недоступны') + ' (HTTP ' + r.status + ')';
+          }
+          $msg.text(hint);
+          setTimeout(function () {
+            $msg.text('');
+          }, 12000);
           return;
         }
+        $msg.text('');
         renderSuggestDropdown(r.body.suggestions || []);
       })
       .catch(function () {
         if (mySeq !== suggestState.seq) return;
         hideSuggestDropdown();
+        $msg.text(
+          Ls('err_suggest_net', 'Сеть: не удалось вызвать подсказки. Проверьте URL бэкенда и CORS/HTTPS.'),
+        );
+        setTimeout(function () {
+          $msg.text('');
+        }, 8000);
       });
   }
 
