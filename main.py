@@ -1001,7 +1001,9 @@ async def amo_sync_lead_webhook(
         )
 
     cfv = _dadata_row_to_amo_cfv(company, write_entity)
-    if not cfv:
+    # В карточке amo «название компании» — стандартное поле name в API, не кастомное (AMO_FIELD_COMPANY_NAME часто не задан).
+    legal_name = (company.get("name") or "").strip() if write_entity == "company" else ""
+    if not cfv and not (write_entity == "company" and legal_name):
         return JSONResponse(
             status_code=200,
             content={"ok": False, "reason": "NO_MAPPED_FIELDS", "lead_id": lead_id},
@@ -1026,7 +1028,12 @@ async def amo_sync_lead_webhook(
         patch_id = lead_id
         patch_log = f"lead {patch_id}"
 
-    patch_body = [{"id": patch_id, "custom_fields_values": cfv}]
+    patch_item: dict[str, Any] = {"id": patch_id}
+    if cfv:
+        patch_item["custom_fields_values"] = cfv
+    if write_entity == "company" and legal_name:
+        patch_item["name"] = legal_name
+    patch_body = [patch_item]
     try:
         pr = await amo.patch(patch_url, json=patch_body)
         pr.raise_for_status()
@@ -1049,13 +1056,16 @@ async def amo_sync_lead_webhook(
         logger.exception("amo недоступен при PATCH: %s", e)
         raise HTTPException(status_code=502, detail="Ошибка сети при обновлении amo") from e
 
+    name_applied = bool(write_entity == "company" and legal_name)
     out: dict[str, Any] = {
         "ok": True,
         "lead_id": lead_id,
         "inn": inn,
-        "fields_updated": len(cfv),
+        "fields_updated": len(cfv) + (1 if name_applied else 0),
         "updated_entity": write_entity,
     }
+    if name_applied:
+        out["company_name_applied"] = True
     if write_entity == "company" and write_company_id is not None:
         out["company_id"] = write_company_id
     return out
