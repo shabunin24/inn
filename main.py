@@ -158,6 +158,75 @@ def _dadata_row_to_amo_lead_cfv(row: dict[str, str]) -> list[dict[str, Any]]:
     return out
 
 
+def _amo_company_inn_field_id() -> int | None:
+    """Поле ИНН у компании (id часто отличается от поля на сделке)."""
+    raw = os.environ.get("AMO_FIELD_INN_COMPANY", "").strip()
+    if raw:
+        try:
+            return int(raw)
+        except ValueError:
+            return None
+    return _amo_lead_field_id("AMO_FIELD_INN")
+
+
+def _amo_linked_company_ids(lead: dict[str, Any]) -> list[int]:
+    out: list[int] = []
+    emb = lead.get("_embedded")
+    if not isinstance(emb, dict):
+        return out
+    for c in emb.get("companies") or []:
+        if not isinstance(c, dict):
+            continue
+        cid = c.get("id")
+        if cid is None:
+            continue
+        try:
+            out.append(int(cid))
+        except (TypeError, ValueError):
+            continue
+    return out
+
+
+async def _amo_fetch_company_dict(amo: httpx.AsyncClient, company_id: int) -> dict[str, Any] | None:
+    try:
+        r = await amo.get(f"/api/v4/companies/{company_id}")
+        r.raise_for_status()
+    except httpx.HTTPStatusError:
+        return None
+    except httpx.RequestError:
+        return None
+    if r.status_code == 204 or not (r.text or "").strip():
+        return None
+    try:
+        data = r.json()
+    except json.JSONDecodeError:
+        return None
+    return data if isinstance(data, dict) else None
+
+
+async def _resolve_inn_for_webhook(
+    amo: httpx.AsyncClient,
+    lead: dict[str, Any],
+    lead_inn_fid: int,
+) -> str:
+    """ИНН со сделки или со связанной компании (_embedded.companies)."""
+    inn = _inn_from_lead_payload(lead, lead_inn_fid)
+    if len(inn) in (10, 12):
+        return inn
+    comp_fid = _amo_company_inn_field_id()
+    if comp_fid is None:
+        return inn
+    for cid in _amo_linked_company_ids(lead):
+        comp = await _amo_fetch_company_dict(amo, cid)
+        if comp is None:
+            continue
+        inn = _inn_from_lead_payload(comp, comp_fid)
+        if len(inn) in (10, 12):
+            logger.info("amo: ИНН взят с компании id=%s (field_id=%s)", cid, comp_fid)
+            return inn
+    return _inn_from_lead_payload(lead, lead_inn_fid)
+
+
 def _inn_from_lead_payload(lead: dict[str, Any], field_id: int) -> str:
     cfv = lead.get("custom_fields_values")
     if not isinstance(cfv, list):
@@ -779,11 +848,17 @@ async def amo_sync_lead_webhook(
         logger.warning("amo GET lead %s: неожиданная форма ответа %s", lead_id, type(lead_raw).__name__)
         raise HTTPException(status_code=502, detail="Неожиданный ответ amo при чтении сделки")
 
-    inn = _inn_from_lead_payload(lead, inn_fid)
+    inn = await _resolve_inn_for_webhook(amo, lead, inn_fid)
     if len(inn) not in (10, 12):
         return JSONResponse(
             status_code=200,
-            content={"ok": False, "reason": "BAD_INN", "lead_id": lead_id, "inn_digits": inn},
+            content={
+                "ok": False,
+                "reason": "BAD_INN",
+                "lead_id": lead_id,
+                "inn_digits": inn,
+                "hint": "ИНН не на сделке и не в связанной компании, или задайте AMO_FIELD_INN_COMPANY (id поля ИНН у компании).",
+            },
         )
 
     company = await _party_company_for_inn(request, inn)
