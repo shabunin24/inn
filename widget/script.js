@@ -96,6 +96,69 @@ define(['jquery'], function ($) {
     return { inn: '', patchMeta: null };
   }
 
+  /** У карточки сделки в _embedded.companies часто нет custom_fields_values — только id. */
+  function fetchCompanyInnFromAmoApi(self, model, settings, done) {
+    var leadFid = parseInt(String(settings.field_inn || '').trim(), 10);
+    var compFid = parseInt(String(settings.field_inn_company || '').trim(), 10) || leadFid;
+    if (!leadFid || typeof self.$authorizedAjax !== 'function') {
+      done({ inn: '', patchMeta: null });
+      return;
+    }
+    var emb = model.get('_embedded');
+    if (!emb || !emb.companies || !emb.companies.length) {
+      done({ inn: '', patchMeta: null });
+      return;
+    }
+    var ids = [];
+    for (var i = 0; i < emb.companies.length; i++) {
+      if (emb.companies[i] && emb.companies[i].id) ids.push(emb.companies[i].id);
+    }
+    if (!ids.length) {
+      done({ inn: '', patchMeta: null });
+      return;
+    }
+    var tryIdx = 0;
+    function tryNext() {
+      if (tryIdx >= ids.length) {
+        done({ inn: '', patchMeta: null });
+        return;
+      }
+      var cid = ids[tryIdx++];
+      self
+        .$authorizedAjax({
+          url: '/api/v4/companies/' + cid,
+          method: 'GET',
+        })
+        .done(function (data) {
+          var cfv = (data && data.custom_fields_values) || [];
+          var inn = extractInnFromCfv(cfv, compFid);
+          if (inn.length !== 10 && inn.length !== 12) inn = extractInnFromCfv(cfv, leadFid);
+          if (inn.length === 10 || inn.length === 12) {
+            done({ inn: inn, patchMeta: { kind: 'companies', id: cid } });
+          } else {
+            tryNext();
+          }
+        })
+        .fail(function () {
+          tryNext();
+        });
+    }
+    tryNext();
+  }
+
+  function resolveInnAndPatchWithApi(self, ctx, model, settings, done) {
+    var sync = resolveInnAndPatch(ctx, model, settings);
+    if (sync.inn.length === 10 || sync.inn.length === 12) {
+      done(sync);
+      return;
+    }
+    if (ctx.kind !== 'leads') {
+      done(sync);
+      return;
+    }
+    fetchCompanyInnFromAmoApi(self, model, settings, done);
+  }
+
   /** Сделка: только доп. поля. Компания: имя + доп. поля. */
   function buildAmoPayload(kind, dadataRow, settings) {
     var cfv = [];
@@ -391,15 +454,16 @@ define(['jquery'], function ($) {
       if (!c || c.id !== ctx.id) return;
       clearTimeout(self._innDadataDebounce);
       self._innDadataDebounce = setTimeout(function () {
-        var resolved = resolveInnAndPatch(c, self._innDadataModel, settings);
-        var inn = resolved.inn;
-        if (inn.length !== 10 && inn.length !== 12) {
-          self._innDadataLastProcessedInn = '';
-          return;
-        }
-        if (inn === self._innDadataLastProcessedInn) return;
-        self._innDadataLastProcessedInn = inn;
-        runPipeline(self, settings, c, inn, false, resolved.patchMeta);
+        resolveInnAndPatchWithApi(self, c, self._innDadataModel, settings, function (resolved) {
+          var inn = resolved.inn;
+          if (inn.length !== 10 && inn.length !== 12) {
+            self._innDadataLastProcessedInn = '';
+            return;
+          }
+          if (inn === self._innDadataLastProcessedInn) return;
+          self._innDadataLastProcessedInn = inn;
+          runPipeline(self, settings, c, inn, false, resolved.patchMeta);
+        });
       }, 550);
     };
 
@@ -410,11 +474,12 @@ define(['jquery'], function ($) {
         if (window.__innDadataBusy) return;
         var cc = currentCardContext();
         if (!cc || cc.id !== ctx.id || !self._innDadataModel) return;
-        var r = resolveInnAndPatch(cc, self._innDadataModel, settings);
-        if (r.inn.length !== 10 && r.inn.length !== 12) return;
-        if (r.inn === self._innDadataLastProcessedInn) return;
-        self._innDadataLastProcessedInn = r.inn;
-        runPipeline(self, settings, cc, r.inn, false, r.patchMeta);
+        resolveInnAndPatchWithApi(self, cc, self._innDadataModel, settings, function (r) {
+          if (r.inn.length !== 10 && r.inn.length !== 12) return;
+          if (r.inn === self._innDadataLastProcessedInn) return;
+          self._innDadataLastProcessedInn = r.inn;
+          runPipeline(self, settings, cc, r.inn, false, r.patchMeta);
+        });
       }, 2500);
     }
   }
@@ -449,9 +514,10 @@ define(['jquery'], function ($) {
             var ctx = currentCardContext();
             if (!ctx) return;
             var st = self.get_settings() || {};
-            var res = resolveInnAndPatch(ctx, ctx.model, st);
-            var pm = res.inn === inn ? res.patchMeta : null;
-            runPipeline(self, st, ctx, inn, false, pm);
+            resolveInnAndPatchWithApi(self, ctx, ctx.model, st, function (res) {
+              var pm = res.inn === inn ? res.patchMeta : null;
+              runPipeline(self, st, ctx, inn, false, pm);
+            });
           });
         $(document)
           .off('click.innDadataSuggestClose')
@@ -472,18 +538,18 @@ define(['jquery'], function ($) {
               return;
             }
             var fromInput = ($('.js-inn-dadata-input').val() || '').replace(/\D/g, '');
-            var resolved = resolveInnAndPatch(ctx, ctx.model, settings);
-            var inn = resolved.inn;
-            var pm = resolved.patchMeta;
             if (fromInput.length === 10 || fromInput.length === 12) {
-              inn = fromInput;
-              pm = null;
-            }
-            if (inn.length !== 10 && inn.length !== 12) {
-              alert(L('err_inn', 'ИНН из 10 или 12 цифр.'));
+              runPipeline(self, settings, ctx, fromInput, true, null);
               return;
             }
-            runPipeline(self, settings, ctx, inn, true, pm);
+            resolveInnAndPatchWithApi(self, ctx, ctx.model, settings, function (resolved) {
+              var inn = resolved.inn;
+              if (inn.length !== 10 && inn.length !== 12) {
+                alert(L('err_inn', 'ИНН из 10 или 12 цифр.'));
+                return;
+              }
+              runPipeline(self, settings, ctx, inn, true, resolved.patchMeta);
+            });
           });
         return true;
       },
