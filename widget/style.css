@@ -10,10 +10,50 @@
 .inn-dadata-widget__row {
   margin-bottom: 8px;
 }
+.inn-dadata-widget__suggest-wrap {
+  position: relative;
+}
 .inn-dadata-widget__input {
   width: 100%;
   box-sizing: border-box;
   padding: 6px 8px;
+}
+.inn-dadata-suggest {
+  display: none;
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  position: absolute;
+  left: 0;
+  right: 0;
+  top: 100%;
+  z-index: 50;
+  max-height: 220px;
+  overflow-y: auto;
+  background: #fff;
+  border: 1px solid #ccc;
+  border-top: none;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.12);
+}
+.inn-dadata-suggest__item {
+  padding: 8px 10px;
+  cursor: pointer;
+  border-bottom: 1px solid #eee;
+  font-size: 12px;
+}
+.inn-dadata-suggest__item:hover {
+  background: #f3f6fa;
+}
+.inn-dadata-suggest__label {
+  display: block;
+  color: #222;
+  line-height: 1.35;
+}
+.inn-dadata-suggest__inn {
+  display: block;
+  color: #666;
+  font-size: 11px;
+  margin-top: 2px;
 }
 .inn-dadata-widget__btn {
   margin-top: 4px;

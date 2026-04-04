@@ -1,7 +1,7 @@
 """
 SaaS backend: ИНН → реквизиты компании (DaData).
 
-Публичное API: POST /company-by-inn (заголовок X-API-KEY).
+Публичное API: POST /company-by-inn, POST /suggest-party (заголовок X-API-KEY).
 
 Вариант C (без виджета amo): POST /integrations/amo/webhook — JSON с lead_id или типовой
 формат вебхука amo (leads.add и т.д.); нужны AMOCRM_API_BASE, AMOCRM_ACCESS_TOKEN, DADATA_API_KEY,
@@ -590,6 +590,20 @@ class InnBody(BaseModel):
         return s
 
 
+class SuggestPartyBody(BaseModel):
+    """Подсказки организаций по фрагменту ИНН или названию (DaData suggest party)."""
+
+    query: str = Field(..., min_length=1, max_length=100)
+
+    @field_validator("query")
+    @classmethod
+    def query_rules(cls, v: str) -> str:
+        s = str(v).strip()
+        if len(s) < 2:
+            raise ValueError("Минимум 2 символа")
+        return s[:100]
+
+
 def _parse_positive_int_id(v: Any) -> int | None:
     if v is None:
         return None
@@ -884,6 +898,48 @@ async def company_by_inn(
 
     entry["used"] += 1
     return company
+
+
+@app.post("/suggest-party")
+async def suggest_party(
+    body: SuggestPartyBody,
+    api_key: Annotated[str, Depends(require_api_key)],
+    request: Request,
+):
+    """
+    Подсказки при наборе текста (виджет). Не тратит лимит API_KEYS — только проверка ключа;
+    вызовы DaData suggest учитывайте в квоте DaData.
+    """
+    _ = api_key  # ключ уже проверен в Depends
+    dadata: DadataAsync | None = request.app.state.dadata
+    if dadata is None:
+        raise HTTPException(status_code=503, detail="DaData не настроена")
+
+    get_dadata_token()
+    try:
+        raw = await dadata.suggest("party", body.query, count=10)
+    except httpx.HTTPStatusError as e:
+        logger.exception("DaData suggest party HTTP: %s", e)
+        raise HTTPException(status_code=502, detail="Ошибка DaData") from e
+    except httpx.RequestError as e:
+        logger.exception("DaData suggest party сеть: %s", e)
+        raise HTTPException(status_code=502, detail="DaData недоступна") from e
+    except Exception as e:  # noqa: BLE001
+        logger.exception("DaData suggest party: %s", e)
+        raise HTTPException(status_code=502, detail="Ошибка DaData") from e
+
+    suggestions: list[dict[str, str]] = []
+    for item in raw or []:
+        if not isinstance(item, dict):
+            continue
+        data = item.get("data") if isinstance(item.get("data"), dict) else {}
+        inn = str(data.get("inn") or "").strip()
+        if len(inn) not in (10, 12):
+            continue
+        label = str(item.get("value") or "").strip() or inn
+        suggestions.append({"inn": inn, "label": label})
+
+    return {"suggestions": suggestions}
 
 
 def _check_amo_webhook_secret(

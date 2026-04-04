@@ -100,6 +100,83 @@ define(['jquery'], function ($) {
     return payload;
   }
 
+  var suggestState = { seq: 0, timer: null };
+
+  function hideSuggestDropdown() {
+    var $b = $('.js-inn-dadata-suggest');
+    $b.empty().hide();
+  }
+
+  function renderSuggestDropdown(items) {
+    var $box = $('.js-inn-dadata-suggest');
+    if (!items || !items.length) {
+      $box.empty().hide();
+      return;
+    }
+    var esc = function (s) {
+      return String(s == null ? '' : s)
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/"/g, '&quot;');
+    };
+    var html = items
+      .map(function (it) {
+        var inn = String(it.inn || '').replace(/\D/g, '');
+        if (inn.length !== 10 && inn.length !== 12) return '';
+        return (
+          '<li class="inn-dadata-suggest__item js-inn-dadata-suggest-item" data-inn="' +
+          esc(inn) +
+          '" tabindex="-1"><span class="inn-dadata-suggest__label">' +
+          esc(it.label || inn) +
+          '</span><span class="inn-dadata-suggest__inn">' +
+          esc(inn) +
+          '</span></li>'
+        );
+      })
+      .join('');
+    if (!html) {
+      $box.empty().hide();
+      return;
+    }
+    $box.html(html).show();
+  }
+
+  function runSuggestRequest(self, settings, q) {
+    if (!String(settings.backend_url || '').trim() || !String(settings.x_api_key || '').trim()) return;
+    if (q.length < 2) {
+      hideSuggestDropdown();
+      return;
+    }
+    suggestState.seq += 1;
+    var mySeq = suggestState.seq;
+    var base = String(settings.backend_url).trim().replace(/\/+$/, '');
+    fetch(base + '/suggest-party', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-API-KEY': String(settings.x_api_key).trim(),
+      },
+      body: JSON.stringify({ query: q }),
+    })
+      .then(function (res) {
+        return res.json().then(function (body) {
+          return { ok: res.ok, body: body };
+        });
+      })
+      .then(function (r) {
+        if (mySeq !== suggestState.seq) return;
+        if (!r.ok) {
+          hideSuggestDropdown();
+          return;
+        }
+        renderSuggestDropdown(r.body.suggestions || []);
+      })
+      .catch(function () {
+        if (mySeq !== suggestState.seq) return;
+        hideSuggestDropdown();
+      });
+  }
+
   function runPipeline(self, settings, ctx, inn, fromButton) {
     var L = function (k, fb) {
       return tr(self, k, fb);
@@ -236,7 +313,7 @@ define(['jquery'], function ($) {
         var inn = extractInnFromModel(self._innDadataModel, innFid);
         if (inn.length !== 10 && inn.length !== 12) return;
         runPipeline(self, settings, c, inn, false);
-      }, 800);
+      }, 400);
     };
 
     ctx.model.on('change:custom_fields_values', self._innDadataHandler);
@@ -251,6 +328,35 @@ define(['jquery'], function ($) {
       },
 
       bind_actions: function () {
+        $(document)
+          .off('input.innDadataSuggest')
+          .on('input.innDadataSuggest', '.js-inn-dadata-input', function () {
+            var q = String($(this).val() || '').trim();
+            clearTimeout(suggestState.timer);
+            suggestState.timer = setTimeout(function () {
+              var st = self.get_settings() || {};
+              runSuggestRequest(self, st, q);
+            }, 260);
+          });
+        $(document)
+          .off('mousedown.innDadataSuggestPick')
+          .on('mousedown.innDadataSuggestPick', '.js-inn-dadata-suggest-item', function (e) {
+            e.preventDefault();
+            var inn = String($(this).data('inn') || '').replace(/\D/g, '');
+            if (inn.length !== 10 && inn.length !== 12) return;
+            hideSuggestDropdown();
+            $('.js-inn-dadata-input').val('');
+            var ctx = currentCardContext();
+            if (!ctx) return;
+            var st = self.get_settings() || {};
+            runPipeline(self, st, ctx, inn, false);
+          });
+        $(document)
+          .off('click.innDadataSuggestClose')
+          .on('click.innDadataSuggestClose', function (e) {
+            if ($(e.target).closest('.inn-dadata-widget__suggest-wrap').length) return;
+            hideSuggestDropdown();
+          });
         $(document)
           .off('click.innDadata')
           .on('click.innDadata', '.js-inn-dadata-fill', function () {
@@ -310,10 +416,11 @@ define(['jquery'], function ($) {
           '<p class="inn-dadata-widget__hint">' +
           hint +
           '</p>' +
-          '<div class="inn-dadata-widget__row">' +
+          '<div class="inn-dadata-widget__row inn-dadata-widget__suggest-wrap">' +
           '<input type="text" class="inn-dadata-widget__input js-inn-dadata-input" placeholder="' +
-          L('inn_placeholder', 'ИНН (если не из поля сделки)') +
-          '" maxlength="12"/>' +
+          L('inn_placeholder', 'ИНН или название — подсказки при вводе') +
+          '" maxlength="100" autocomplete="off"/>' +
+          '<ul class="inn-dadata-suggest js-inn-dadata-suggest" role="listbox" aria-hidden="true"></ul>' +
           '</div>' +
           '<button type="button" class="inn-dadata-widget__btn js-inn-dadata-fill">' +
           L('button', 'Заполнить из DaData') +
@@ -349,6 +456,10 @@ define(['jquery'], function ($) {
 
       destroy: function () {
         $(document).off('click.innDadata');
+        $(document).off('input.innDadataSuggest');
+        $(document).off('mousedown.innDadataSuggestPick');
+        $(document).off('click.innDadataSuggestClose');
+        hideSuggestDropdown();
         detachInnWatcher(self);
         return true;
       },
