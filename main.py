@@ -5,7 +5,7 @@ SaaS backend: ИНН → реквизиты компании (DaData).
 
 Вариант C (без виджета amo): POST /integrations/amo/webhook — JSON с lead_id или типовой
 формат вебхука amo (leads.add и т.д.); нужны AMOCRM_API_BASE, AMOCRM_ACCESS_TOKEN, DADATA_API_KEY,
-поле ИНН на сделке (AMO_FIELD_INN или значение по умолчанию в коде).
+поля amo (AMO_FIELD_*): при записи ИНН берётся со сделки — PATCH сделки; если ИНН только у связанной компании — PATCH компании (те же id полей или AMO_FIELD_*_COMPANY).
 
 Деплой на Render:
   - Environment (см. блок «Внешние API» ниже в коде)
@@ -22,7 +22,7 @@ import re
 from urllib.parse import parse_qs
 from datetime import datetime, timezone
 from contextlib import asynccontextmanager
-from typing import Annotated, Any
+from typing import Annotated, Any, Literal, NamedTuple
 
 import httpx
 from dadata import DadataAsync
@@ -127,8 +127,20 @@ def _amo_lead_field_id(env_name: str) -> int | None:
         return None
 
 
-def _dadata_row_to_amo_lead_cfv(row: dict[str, str]) -> list[dict[str, Any]]:
-    """Собирает custom_fields_values для PATCH сделки."""
+def _amo_company_field_id(base_env: str) -> int | None:
+    """Id поля у компании: AMO_FIELD_XXX_COMPANY, иначе то же, что для сделки."""
+    raw = os.environ.get(f"{base_env}_COMPANY", "").strip()
+    if raw:
+        try:
+            return int(raw)
+        except ValueError:
+            return None
+    return _amo_lead_field_id(base_env)
+
+
+def _dadata_row_to_amo_cfv(row: dict[str, str], entity: Literal["lead", "company"]) -> list[dict[str, Any]]:
+    """Собирает custom_fields_values для PATCH сделки или компании."""
+    pick = _amo_lead_field_id if entity == "lead" else _amo_company_field_id
     mapping: list[tuple[str, str]] = [
         ("inn", "AMO_FIELD_INN"),
         ("kpp", "AMO_FIELD_KPP"),
@@ -148,7 +160,7 @@ def _dadata_row_to_amo_lead_cfv(row: dict[str, str]) -> list[dict[str, Any]]:
     ]
     out: list[dict[str, Any]] = []
     for row_key, env_name in mapping:
-        fid = _amo_lead_field_id(env_name)
+        fid = pick(env_name)
         if fid is None:
             continue
         val = (row.get(row_key) or "").strip()
@@ -160,13 +172,7 @@ def _dadata_row_to_amo_lead_cfv(row: dict[str, str]) -> list[dict[str, Any]]:
 
 def _amo_company_inn_field_id() -> int | None:
     """Поле ИНН у компании (id часто отличается от поля на сделке)."""
-    raw = os.environ.get("AMO_FIELD_INN_COMPANY", "").strip()
-    if raw:
-        try:
-            return int(raw)
-        except ValueError:
-            return None
-    return _amo_lead_field_id("AMO_FIELD_INN")
+    return _amo_company_field_id("AMO_FIELD_INN")
 
 
 def _amo_linked_company_ids(lead: dict[str, Any]) -> list[int]:
@@ -262,27 +268,34 @@ async def _amo_fetch_company_dict(amo: httpx.AsyncClient, company_id: int) -> di
     return data if isinstance(data, dict) else None
 
 
+class _InnWebhookResolution(NamedTuple):
+    inn: str
+    write_entity: Literal["lead", "company"]
+    company_id: int | None
+
+
 async def _resolve_inn_for_webhook(
     amo: httpx.AsyncClient,
     lead: dict[str, Any],
     lead_inn_fid: int,
-) -> str:
-    """ИНН со сделки или со связанной компании (_embedded.companies)."""
+) -> _InnWebhookResolution:
+    """ИНН со сделки или со связанной компании; куда писать реквизиты DaData — в ту же сущность."""
     inn = _inn_from_lead_payload(lead, lead_inn_fid)
     if len(inn) in (10, 12):
-        return inn
+        return _InnWebhookResolution(inn, "lead", None)
     inn = _scan_entity_custom_fields_for_inn_digits(lead)
     if len(inn) in (10, 12):
         logger.info("amo: ИНН на сделке найден по разбору кастомных полей (10/12 цифр)")
-        return inn
+        return _InnWebhookResolution(inn, "lead", None)
     inn = _inn_from_entity_name(lead)
     if len(inn) in (10, 12):
         logger.info("amo: ИНН из названия сделки")
-        return inn
+        return _InnWebhookResolution(inn, "lead", None)
 
     comp_fid = _amo_company_inn_field_id()
     if comp_fid is None:
-        return _inn_from_lead_payload(lead, lead_inn_fid)
+        inn = _inn_from_lead_payload(lead, lead_inn_fid)
+        return _InnWebhookResolution(inn, "lead", None)
     for cid in _amo_linked_company_ids(lead):
         comp = await _amo_fetch_company_dict(amo, cid)
         if comp is None:
@@ -290,19 +303,20 @@ async def _resolve_inn_for_webhook(
         inn = _inn_from_lead_payload(comp, comp_fid)
         if len(inn) in (10, 12):
             logger.info("amo: ИНН взят с компании id=%s (field_id=%s)", cid, comp_fid)
-            return inn
+            return _InnWebhookResolution(inn, "company", cid)
         inn = _scan_entity_custom_fields_for_inn_digits(comp)
         if len(inn) in (10, 12):
             logger.info("amo: ИНН на компании id=%s найден по разбору полей (10/12 цифр)", cid)
-            return inn
+            return _InnWebhookResolution(inn, "company", cid)
         inn = _inn_from_entity_name(comp)
         if len(inn) in (10, 12):
             logger.info("amo: ИНН из названия компании id=%s", cid)
-            return inn
+            return _InnWebhookResolution(inn, "company", cid)
         cfv_dbg = comp.get("custom_fields_values")
         cfv_n = len(cfv_dbg) if isinstance(cfv_dbg, list) else "null"
         logger.warning("amo: компания id=%s — ИНН не извлечён (custom_fields_values len=%s)", cid, cfv_n)
-    return _inn_from_lead_payload(lead, lead_inn_fid)
+    inn = _inn_from_lead_payload(lead, lead_inn_fid)
+    return _InnWebhookResolution(inn, "lead", None)
 
 
 async def _amo_enrich_lead_with_companies_if_needed(
@@ -963,7 +977,10 @@ async def amo_sync_lead_webhook(
 
     lead = await _amo_enrich_lead_with_companies_if_needed(amo, lead, lead_id)
 
-    inn = await _resolve_inn_for_webhook(amo, lead, inn_fid)
+    resolved = await _resolve_inn_for_webhook(amo, lead, inn_fid)
+    inn = resolved.inn
+    write_entity = resolved.write_entity
+    write_company_id = resolved.company_id
     if len(inn) not in (10, 12):
         return JSONResponse(
             status_code=200,
@@ -983,30 +1000,48 @@ async def amo_sync_lead_webhook(
             content={"ok": False, "reason": "NOT_FOUND", "lead_id": lead_id, "inn": inn},
         )
 
-    cfv = _dadata_row_to_amo_lead_cfv(company)
+    cfv = _dadata_row_to_amo_cfv(company, write_entity)
     if not cfv:
         return JSONResponse(
             status_code=200,
             content={"ok": False, "reason": "NO_MAPPED_FIELDS", "lead_id": lead_id},
         )
 
-    patch_body = [{"id": lead_id, "custom_fields_values": cfv}]
+    if write_entity == "company":
+        if write_company_id is None:
+            logger.error("amo webhook: write_entity=company без company_id, lead_id=%s", lead_id)
+            return JSONResponse(
+                status_code=200,
+                content={
+                    "ok": False,
+                    "reason": "INTERNAL_NO_COMPANY_ID",
+                    "lead_id": lead_id,
+                },
+            )
+        patch_url = "/api/v4/companies"
+        patch_id = write_company_id
+        patch_log = f"company {patch_id}"
+    else:
+        patch_url = "/api/v4/leads"
+        patch_id = lead_id
+        patch_log = f"lead {patch_id}"
+
+    patch_body = [{"id": patch_id, "custom_fields_values": cfv}]
     try:
-        pr = await amo.patch("/api/v4/leads", json=patch_body)
+        pr = await amo.patch(patch_url, json=patch_body)
         pr.raise_for_status()
     except httpx.HTTPStatusError as e:
         raw = (e.response.text or "")[:1500] if e.response else ""
-        logger.warning("amo PATCH lead %s: %s body=%s", lead_id, e, raw[:800])
+        logger.warning("amo PATCH %s: %s body=%s", patch_log, e, raw[:800])
         raise HTTPException(
             status_code=502,
             detail={
-                "message": "Не удалось обновить сделку в amo",
+                "message": f"Не удалось обновить {'компанию' if write_entity == 'company' else 'сделку'} в amo",
                 "amo_http_status": e.response.status_code if e.response else None,
                 "amo_response": raw or None,
                 "hint": (
-                    "Поля в PATCH должны существовать у сущности «Сделка». Если ИНН в API только у компании, "
-                    "а КПП/адрес и т.д. заведены только у «Компании» с другими field_id — amo вернёт ошибку валидации. "
-                    "Добавьте те же поля на сделку или задайте AMO_FIELD_* под id полей сделки."
+                    "Поля в PATCH должны существовать у той сущности (сделка или компания), куда идёт запрос. "
+                    "При необходимости задайте AMO_FIELD_*_COMPANY для id полей компании."
                 ),
             },
         ) from e
@@ -1014,7 +1049,16 @@ async def amo_sync_lead_webhook(
         logger.exception("amo недоступен при PATCH: %s", e)
         raise HTTPException(status_code=502, detail="Ошибка сети при обновлении amo") from e
 
-    return {"ok": True, "lead_id": lead_id, "inn": inn, "fields_updated": len(cfv)}
+    out: dict[str, Any] = {
+        "ok": True,
+        "lead_id": lead_id,
+        "inn": inn,
+        "fields_updated": len(cfv),
+        "updated_entity": write_entity,
+    }
+    if write_entity == "company" and write_company_id is not None:
+        out["company_id"] = write_company_id
+    return out
 
 
 if __name__ == "__main__":
