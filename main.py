@@ -482,6 +482,12 @@ API_KEYS: dict[str, dict[str, int]] = {
 
 # Кеш ответов по ИНН (in-memory; не шарится между воркерами)
 CACHE: dict[str, dict[str, str]] = {}
+# Смена версии сбрасывает кэш party по ИНН (например после изменения разбора названия из DaData).
+_PARTY_CACHE_VER = "v3"
+
+
+def _party_cache_key(inn: str) -> str:
+    return f"{_PARTY_CACHE_VER}:{inn}"
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -764,8 +770,24 @@ def _finance_str(data: dict[str, Any], *keys: str) -> str:
     return ""
 
 
-def party_to_company(data: dict[str, Any]) -> dict[str, str]:
-    name = (data.get("name") or {}).get("full_with_opf") or ""
+def _party_legal_name(data: dict[str, Any]) -> str:
+    """Название из блока data.name; у ИП/филиалов часто пустой full_with_opf, но есть full/short."""
+    n = data.get("name")
+    if isinstance(n, dict):
+        for k in ("full_with_opf", "full", "short"):
+            v = n.get(k)
+            if v is not None and str(v).strip():
+                return str(v).strip()
+        return ""
+    if isinstance(n, str) and n.strip():
+        return n.strip()
+    return ""
+
+
+def party_to_company(data: dict[str, Any], fallback_display: str | None = None) -> dict[str, str]:
+    name = _party_legal_name(data)
+    if not name and fallback_display:
+        name = str(fallback_display).strip()
     address = (data.get("address") or {}).get("value") or ""
     management = data.get("management") or {}
     director = management.get("name") or ""
@@ -804,8 +826,9 @@ async def _party_company_for_inn(request: Request, inn: str) -> dict[str, str] |
     Кеш или DaData → словарь реквизитов. None если организация не найдена.
     Не меняет счётчики API_KEYS (для вебхука amo и внутренних вызовов).
     """
-    if inn in CACHE:
-        return CACHE[inn]
+    ck = _party_cache_key(inn)
+    if ck in CACHE:
+        return CACHE[ck]
 
     dadata: DadataAsync | None = request.app.state.dadata
     if dadata is None:
@@ -835,8 +858,10 @@ async def _party_company_for_inn(request: Request, inn: str) -> dict[str, str] |
     first = zeroth.get("data") or {}
     if not isinstance(first, dict):
         first = {}
-    company = party_to_company(first)
-    CACHE[inn] = company
+    sug = zeroth.get("value")
+    fb = str(sug).strip() if sug is not None and str(sug).strip() else None
+    company = party_to_company(first, fallback_display=fb)
+    CACHE[ck] = company
     return company
 
 
@@ -1032,8 +1057,16 @@ async def amo_sync_lead_webhook(
     if cfv:
         patch_item["custom_fields_values"] = cfv
     if write_entity == "company" and legal_name:
-        patch_item["name"] = legal_name
+        # Лимит названия в amo обычно сотни символов; обрезаем по символам, не по байтам.
+        patch_item["name"] = legal_name[:255]
     patch_body = [patch_item]
+    logger.info(
+        "amo webhook PATCH %s: name_len=%s cfv_count=%s keys=%s",
+        patch_log,
+        len(legal_name) if write_entity == "company" else 0,
+        len(cfv),
+        list(patch_item.keys()),
+    )
     try:
         pr = await amo.patch(patch_url, json=patch_body)
         pr.raise_for_status()
@@ -1066,6 +1099,7 @@ async def amo_sync_lead_webhook(
     }
     if name_applied:
         out["company_name_applied"] = True
+        out["company_name_preview"] = legal_name[:120] + ("…" if len(legal_name) > 120 else "")
     if write_entity == "company" and write_company_id is not None:
         out["company_id"] = write_company_id
     return out
