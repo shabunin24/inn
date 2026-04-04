@@ -996,10 +996,20 @@ async def amo_webhook_get_info():
     Логи Render с «405» на этом пути чаще всего из‑за проверки ссылки в браузере.
     """
     return {
-        "hint": "Этот адрес вызывается методом POST из amo или curl, не из адресной строки браузера.",
+        "hint": "Ответ на / только значит «сервер жив». Сделки в amo сами не обновятся — нужен POST на этот путь из amo (робот) или curl.",
         "method": "POST",
         "content_type": "application/json",
         "example_body": {"lead_id": 12345},
+        "amo_setup": [
+            "amo → Сделки → воронка → Digital pipeline / Роботы → действие «Отправить вебхук».",
+            "URL: https://ВАШ.onrender.com/integrations/amo/webhook , POST, JSON с id сделки, напр. {\"lead_id\": \"{{lead.id}}\"} (макрос из подсказок amo).",
+            "Без робота сервер не вызывается — в карточке «ничего не происходит».",
+        ],
+        "self_test": (
+            'curl -sS -X POST "https://ВАШ.onrender.com/integrations/amo/webhook" '
+            '-H "Content-Type: application/json" -d \'{"lead_id": 12345678}\''
+        ),
+        "render_logs": "Ищите «amo webhook:» и при успехе ответ с ok:true; при ok:false — reason (BAD_INN, NO_LEAD_ID, …).",
     }
 
 
@@ -1021,6 +1031,7 @@ async def amo_sync_lead_webhook(
     ct = request.headers.get("content-type", "")
     data = _parse_amo_webhook_json_body(raw, ct)
     if data is None:
+        logger.info("amo webhook result: INVALID_JSON")
         return JSONResponse(
             status_code=200,
             content={
@@ -1046,6 +1057,7 @@ async def amo_sync_lead_webhook(
     _check_amo_webhook_secret(body_secret, x_webhook_secret)
 
     if lead_id is None:
+        logger.info("amo webhook result: NO_LEAD_ID")
         return JSONResponse(
             status_code=200,
             content={
@@ -1106,6 +1118,7 @@ async def amo_sync_lead_webhook(
         lead_id,
     )
     if len(inn) not in (10, 12):
+        logger.info("amo webhook result: BAD_INN lead_id=%s inn_digits=%r", lead_id, inn)
         return JSONResponse(
             status_code=200,
             content={
@@ -1122,6 +1135,7 @@ async def amo_sync_lead_webhook(
 
     company = await _party_company_for_inn(request, inn, use_cache=False)
     if company is None:
+        logger.info("amo webhook result: NOT_FOUND lead_id=%s inn=%s", lead_id, inn)
         return JSONResponse(
             status_code=200,
             content={"ok": False, "reason": "NOT_FOUND", "lead_id": lead_id, "inn": inn},
@@ -1135,6 +1149,7 @@ async def amo_sync_lead_webhook(
     # В карточке amo «название компании» — стандартное поле name в API, не кастомное (AMO_FIELD_COMPANY_NAME часто не задан).
     legal_name = (company.get("name") or "").strip() if write_entity == "company" else ""
     if not cfv and not (write_entity == "company" and legal_name):
+        logger.info("amo webhook result: NO_MAPPED_FIELDS lead_id=%s", lead_id)
         return JSONResponse(
             status_code=200,
             content={"ok": False, "reason": "NO_MAPPED_FIELDS", "lead_id": lead_id},
@@ -1143,6 +1158,7 @@ async def amo_sync_lead_webhook(
     if write_entity == "company":
         if write_company_id is None:
             logger.error("amo webhook: write_entity=company без company_id, lead_id=%s", lead_id)
+            logger.info("amo webhook result: INTERNAL_NO_COMPANY_ID lead_id=%s", lead_id)
             return JSONResponse(
                 status_code=200,
                 content={
@@ -1208,6 +1224,7 @@ async def amo_sync_lead_webhook(
         out["company_name_preview"] = legal_name[:120] + ("…" if len(legal_name) > 120 else "")
     if write_entity == "company" and write_company_id is not None:
         out["company_id"] = write_company_id
+    logger.info("amo webhook OK %s", out)
     return out
 
 
