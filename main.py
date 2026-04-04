@@ -138,8 +138,17 @@ def _amo_company_field_id(base_env: str) -> int | None:
     return _amo_lead_field_id(base_env)
 
 
-def _dadata_row_to_amo_cfv(row: dict[str, str], entity: Literal["lead", "company"]) -> list[dict[str, Any]]:
-    """Собирает custom_fields_values для PATCH сделки или компании."""
+def _dadata_row_to_amo_cfv(
+    row: dict[str, str],
+    entity: Literal["lead", "company"],
+    *,
+    include_empty: bool = False,
+) -> list[dict[str, Any]]:
+    """
+    Собирает custom_fields_values для PATCH сделки или компании.
+    include_empty=True — шлём и пустые строки по всем настроенным field_id, чтобы в amo не оставались
+    значения от предыдущей организации (иначе PATCH только «непустые» поля, остальное amo не трогает).
+    """
     pick = _amo_lead_field_id if entity == "lead" else _amo_company_field_id
     mapping: list[tuple[str, str]] = [
         ("inn", "AMO_FIELD_INN"),
@@ -164,7 +173,9 @@ def _dadata_row_to_amo_cfv(row: dict[str, str], entity: Literal["lead", "company
         if fid is None:
             continue
         val = (row.get(row_key) or "").strip()
-        if not val:
+        if not val and not include_empty:
+            continue
+        if not val and row_key == "inn":
             continue
         out.append({"field_id": fid, "values": [{"value": val}]})
     return out
@@ -486,7 +497,7 @@ API_KEYS: dict[str, dict[str, int]] = {
 # Кеш ответов по ИНН (in-memory; не шарится между воркерами)
 CACHE: dict[str, dict[str, str]] = {}
 # Смена версии сбрасывает кэш party по ИНН (например после изменения разбора названия из DaData).
-_PARTY_CACHE_VER = "v3"
+_PARTY_CACHE_VER = "v4"
 
 
 def _party_cache_key(inn: str) -> str:
@@ -494,6 +505,11 @@ def _party_cache_key(inn: str) -> str:
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+
+def _webhook_patch_include_empty_fields() -> bool:
+    """Очищать в amo поля, для которых в DaData пусто (убирает «хвост» прошлой организации). Выключить: AMO_WEBHOOK_CLEAR_OLD_FIELDS=0"""
+    return os.environ.get("AMO_WEBHOOK_CLEAR_OLD_FIELDS", "1").strip().lower() not in ("0", "false", "no")
 
 
 def _resolve_dadata_api_key() -> str:
@@ -848,13 +864,18 @@ def party_to_company(data: dict[str, Any], fallback_display: str | None = None) 
     }
 
 
-async def _party_company_for_inn(request: Request, inn: str) -> dict[str, str] | None:
+async def _party_company_for_inn(
+    request: Request,
+    inn: str,
+    *,
+    use_cache: bool = True,
+) -> dict[str, str] | None:
     """
     Кеш или DaData → словарь реквизитов. None если организация не найдена.
-    Не меняет счётчики API_KEYS (для вебхука amo и внутренних вызовов).
+    Для вебхука use_cache=False — всегда свежий findById (иначе после смены ИНН возможны «старые» реквизиты).
     """
     ck = _party_cache_key(inn)
-    if ck in CACHE:
+    if use_cache and ck in CACHE:
         return CACHE[ck]
 
     dadata: DadataAsync | None = request.app.state.dadata
@@ -888,7 +909,8 @@ async def _party_company_for_inn(request: Request, inn: str) -> dict[str, str] |
     sug = zeroth.get("value")
     fb = str(sug).strip() if sug is not None and str(sug).strip() else None
     company = party_to_company(first, fallback_display=fb)
-    CACHE[ck] = company
+    if use_cache:
+        CACHE[ck] = company
     return company
 
 
@@ -1076,6 +1098,13 @@ async def amo_sync_lead_webhook(
     inn = resolved.inn
     write_entity = resolved.write_entity
     write_company_id = resolved.company_id
+    logger.info(
+        "amo webhook: resolved inn=%s entity=%s company_id=%s lead_id=%s",
+        inn,
+        write_entity,
+        write_company_id,
+        lead_id,
+    )
     if len(inn) not in (10, 12):
         return JSONResponse(
             status_code=200,
@@ -1084,18 +1113,25 @@ async def amo_sync_lead_webhook(
                 "reason": "BAD_INN",
                 "lead_id": lead_id,
                 "inn_digits": inn,
-                "hint": "ИНН не на сделке и не в связанной компании, или задайте AMO_FIELD_INN_COMPANY (id поля ИНН у компании).",
+                "hint": (
+                    "Нет ИНН 10/12 цифр: на новой сделке привяжите компанию с ИНН или заполните ИНН на сделке. "
+                    "Если ИНН только у компании — в Render задайте AMO_FIELD_INN_COMPANY (id поля ИНН компании)."
+                ),
             },
         )
 
-    company = await _party_company_for_inn(request, inn)
+    company = await _party_company_for_inn(request, inn, use_cache=False)
     if company is None:
         return JSONResponse(
             status_code=200,
             content={"ok": False, "reason": "NOT_FOUND", "lead_id": lead_id, "inn": inn},
         )
 
-    cfv = _dadata_row_to_amo_cfv(company, write_entity)
+    cfv = _dadata_row_to_amo_cfv(
+        company,
+        write_entity,
+        include_empty=_webhook_patch_include_empty_fields(),
+    )
     # В карточке amo «название компании» — стандартное поле name в API, не кастомное (AMO_FIELD_COMPANY_NAME часто не задан).
     legal_name = (company.get("name") or "").strip() if write_entity == "company" else ""
     if not cfv and not (write_entity == "company" and legal_name):
