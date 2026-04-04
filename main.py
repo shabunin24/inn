@@ -995,8 +995,21 @@ async def amo_sync_lead_webhook(
         pr = await amo.patch("/api/v4/leads", json=patch_body)
         pr.raise_for_status()
     except httpx.HTTPStatusError as e:
-        logger.warning("amo PATCH lead %s: %s %s", lead_id, e, e.response.text[:500] if e.response else "")
-        raise HTTPException(status_code=502, detail="Не удалось обновить сделку в amo") from e
+        raw = (e.response.text or "")[:1500] if e.response else ""
+        logger.warning("amo PATCH lead %s: %s body=%s", lead_id, e, raw[:800])
+        raise HTTPException(
+            status_code=502,
+            detail={
+                "message": "Не удалось обновить сделку в amo",
+                "amo_http_status": e.response.status_code if e.response else None,
+                "amo_response": raw or None,
+                "hint": (
+                    "Поля в PATCH должны существовать у сущности «Сделка». Если ИНН в API только у компании, "
+                    "а КПП/адрес и т.д. заведены только у «Компании» с другими field_id — amo вернёт ошибку валидации. "
+                    "Добавьте те же поля на сделку или задайте AMO_FIELD_* под id полей сделки."
+                ),
+            },
+        ) from e
     except httpx.RequestError as e:
         logger.exception("amo недоступен при PATCH: %s", e)
         raise HTTPException(status_code=502, detail="Ошибка сети при обновлении amo") from e
