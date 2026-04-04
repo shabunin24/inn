@@ -1,0 +1,10 @@
+# Blueprint Render: https://render.com/docs/blueprint-spec
+# Если сервис уже создан вручную — сверьте Start Command с полем startCommand ниже.
+services:
+  - type: web
+    name: inn
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /

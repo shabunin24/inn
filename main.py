@@ -733,7 +733,12 @@ async def root():
     return {
         "status": "ok",
         "build": "suggest-party-v1",
-        "post": ["/company-by-inn", "/suggest-party", "/integrations/amo/webhook"],
+        "post": [
+            "/company-by-inn",
+            "/suggest-party",
+            "/api/suggest-party",
+            "/integrations/amo/webhook",
+        ],
     }
 
 
@@ -906,6 +911,7 @@ async def company_by_inn(
 
 
 @app.post("/suggest-party")
+@app.post("/api/suggest-party")
 async def suggest_party(
     body: SuggestPartyBody,
     api_key: Annotated[str, Depends(require_api_key)],

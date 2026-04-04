@@ -48,4 +48,16 @@ URL и X-API-KEY в ваших настройках / константах.
 
 6) На Render в Environment должен быть задан DADATA_API_KEY.
 
+RENDER: если в логах POST /suggest-party → 404
+-------------------------------------------
+На инстансе запущен старый код (без маршрута) или неверная команда старта.
+
+• Settings → Build & Deploy: Root Directory пустой (корень репозитория).
+• Start Command должно быть:  uvicorn main:app --host 0.0.0.0 --port $PORT
+  (как в render.yaml в корне репо).
+• Manual Deploy → Clear build cache & deploy.
+• Проверка: откройте в браузере https://ВАШ.onrender.com/
+  в JSON должны быть "build":"suggest-party-v1" и путь "/suggest-party" в списке post.
+  Если только {"status":"ok"} — деплой ещё не с актуального main.
+
 Подробнее про API бэкенда: см. main.py и /docs на вашем сервере.
