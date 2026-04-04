@@ -187,10 +187,40 @@ def _amo_linked_company_ids(lead: dict[str, Any]) -> list[int]:
     return out
 
 
+def _flatten_amo_cfv_value_cell(val: Any) -> list[str]:
+    """Все текстовые фрагменты из ячейки custom_fields_values[].values[] (в т.ч. вложенные dict/list в amo)."""
+    out: list[str] = []
+    if val is None:
+        return out
+    if isinstance(val, bool):
+        return out
+    if isinstance(val, (str, int, float)):
+        out.append(str(val))
+        return out
+    if isinstance(val, dict):
+        for x in val.values():
+            out.extend(_flatten_amo_cfv_value_cell(x))
+    elif isinstance(val, list):
+        for x in val:
+            out.extend(_flatten_amo_cfv_value_cell(x))
+    return out
+
+
+def _first_inn_substring_from_digits(digits: str) -> str:
+    """10 или 12 подряд цифр; при более длинной строке — первое окно длины 12, затем 10."""
+    if len(digits) in (10, 12):
+        return digits
+    for ln in (12, 10):
+        if len(digits) < ln:
+            continue
+        for i in range(0, len(digits) - ln + 1):
+            return digits[i : i + ln]
+    return ""
+
+
 def _scan_entity_custom_fields_for_inn_digits(entity: dict[str, Any]) -> str:
     """
-    Если id поля ИНН не совпал с настройками, ищем в кастомных полях значение из 10 или 12 цифр
-    (формат ИНН юрлица / ИП). Берётся первое подходящее.
+    Ищем ИНН в кастомных полях: любая вложенность в values[], затем 10/12 цифр подряд.
     """
     cfv = entity.get("custom_fields_values")
     if not isinstance(cfv, list):
@@ -198,17 +228,21 @@ def _scan_entity_custom_fields_for_inn_digits(entity: dict[str, Any]) -> str:
     for block in cfv:
         if not isinstance(block, dict):
             continue
-        for v in block.get("values") or []:
-            if not isinstance(v, dict):
-                continue
-            for key in ("value", "enum_code"):
-                raw = v.get(key)
-                if raw is None:
-                    continue
-                digits = "".join(c for c in str(raw) if c.isdigit())
-                if len(digits) in (10, 12):
-                    return digits
+        for cell in block.get("values") or []:
+            for text in _flatten_amo_cfv_value_cell(cell):
+                digits = "".join(c for c in text if c.isdigit())
+                inn = _first_inn_substring_from_digits(digits)
+                if inn:
+                    return inn
     return ""
+
+
+def _inn_from_entity_name(entity: dict[str, Any]) -> str:
+    name = entity.get("name")
+    if name is None or not str(name).strip():
+        return ""
+    digits = "".join(c for c in str(name) if c.isdigit())
+    return _first_inn_substring_from_digits(digits)
 
 
 async def _amo_fetch_company_dict(amo: httpx.AsyncClient, company_id: int) -> dict[str, Any] | None:
@@ -241,6 +275,10 @@ async def _resolve_inn_for_webhook(
     if len(inn) in (10, 12):
         logger.info("amo: ИНН на сделке найден по разбору кастомных полей (10/12 цифр)")
         return inn
+    inn = _inn_from_entity_name(lead)
+    if len(inn) in (10, 12):
+        logger.info("amo: ИНН из названия сделки")
+        return inn
 
     comp_fid = _amo_company_inn_field_id()
     if comp_fid is None:
@@ -257,6 +295,13 @@ async def _resolve_inn_for_webhook(
         if len(inn) in (10, 12):
             logger.info("amo: ИНН на компании id=%s найден по разбору полей (10/12 цифр)", cid)
             return inn
+        inn = _inn_from_entity_name(comp)
+        if len(inn) in (10, 12):
+            logger.info("amo: ИНН из названия компании id=%s", cid)
+            return inn
+        cfv_dbg = comp.get("custom_fields_values")
+        cfv_n = len(cfv_dbg) if isinstance(cfv_dbg, list) else "null"
+        logger.warning("amo: компания id=%s — ИНН не извлечён (custom_fields_values len=%s)", cid, cfv_n)
     return _inn_from_lead_payload(lead, lead_inn_fid)
 
 
