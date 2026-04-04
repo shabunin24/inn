@@ -187,6 +187,30 @@ def _amo_linked_company_ids(lead: dict[str, Any]) -> list[int]:
     return out
 
 
+def _scan_entity_custom_fields_for_inn_digits(entity: dict[str, Any]) -> str:
+    """
+    Если id поля ИНН не совпал с настройками, ищем в кастомных полях значение из 10 или 12 цифр
+    (формат ИНН юрлица / ИП). Берётся первое подходящее.
+    """
+    cfv = entity.get("custom_fields_values")
+    if not isinstance(cfv, list):
+        return ""
+    for block in cfv:
+        if not isinstance(block, dict):
+            continue
+        for v in block.get("values") or []:
+            if not isinstance(v, dict):
+                continue
+            for key in ("value", "enum_code"):
+                raw = v.get(key)
+                if raw is None:
+                    continue
+                digits = "".join(c for c in str(raw) if c.isdigit())
+                if len(digits) in (10, 12):
+                    return digits
+    return ""
+
+
 async def _amo_fetch_company_dict(amo: httpx.AsyncClient, company_id: int) -> dict[str, Any] | None:
     try:
         r = await amo.get(f"/api/v4/companies/{company_id}")
@@ -213,9 +237,14 @@ async def _resolve_inn_for_webhook(
     inn = _inn_from_lead_payload(lead, lead_inn_fid)
     if len(inn) in (10, 12):
         return inn
+    inn = _scan_entity_custom_fields_for_inn_digits(lead)
+    if len(inn) in (10, 12):
+        logger.info("amo: ИНН на сделке найден по разбору кастомных полей (10/12 цифр)")
+        return inn
+
     comp_fid = _amo_company_inn_field_id()
     if comp_fid is None:
-        return inn
+        return _inn_from_lead_payload(lead, lead_inn_fid)
     for cid in _amo_linked_company_ids(lead):
         comp = await _amo_fetch_company_dict(amo, cid)
         if comp is None:
@@ -223,6 +252,10 @@ async def _resolve_inn_for_webhook(
         inn = _inn_from_lead_payload(comp, comp_fid)
         if len(inn) in (10, 12):
             logger.info("amo: ИНН взят с компании id=%s (field_id=%s)", cid, comp_fid)
+            return inn
+        inn = _scan_entity_custom_fields_for_inn_digits(comp)
+        if len(inn) in (10, 12):
+            logger.info("amo: ИНН на компании id=%s найден по разбору полей (10/12 цифр)", cid)
             return inn
     return _inn_from_lead_payload(lead, lead_inn_fid)
 
