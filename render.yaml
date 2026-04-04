@@ -1,5 +1,6 @@
 # Blueprint Render: https://render.com/docs/blueprint-spec
-# Если сервис уже создан вручную — сверьте Start Command с полем startCommand ниже.
+# ВАЖНО: без --host 0.0.0.0 uvicorn слушает 127.0.0.1 → Render: "no open ports" / Port scan timeout.
+# Если сервис уже создан вручную — скопируйте startCommand в Settings или используйте Procfile.
 services:
   - type: web
     name: inn

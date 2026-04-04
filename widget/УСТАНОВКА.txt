@@ -48,13 +48,21 @@ URL и X-API-KEY в ваших настройках / константах.
 
 6) На Render в Environment должен быть задан DADATA_API_KEY.
 
+RENDER: Port scan timeout / no open ports
+----------------------------------------
+Uvicorn по умолчанию вешается на 127.0.0.1 — снаружи порт «не виден», деплой падает по таймауту.
+
+• Start Command (обязательно 0.0.0.0 и переменная PORT):
+    uvicorn main:app --host 0.0.0.0 --port $PORT
+  Либо оставьте поле пустым — подхватится Procfile из репозитория (там то же самое).
+• Не используйте: uvicorn main:app --port $PORT  (без --host 0.0.0.0).
+
 RENDER: если в логах POST /suggest-party → 404
 -------------------------------------------
-На инстансе запущен старый код (без маршрута) или неверная команда старта.
+На инстансе старый код или неверная команда старта.
 
 • Settings → Build & Deploy: Root Directory пустой (корень репозитория).
-• Start Command должно быть:  uvicorn main:app --host 0.0.0.0 --port $PORT
-  (как в render.yaml в корне репо).
+• Start Command — см. блок выше (с --host 0.0.0.0).
 • Manual Deploy → Clear build cache & deploy.
 • Проверка: откройте в браузере https://ВАШ.onrender.com/
   в JSON должны быть "build":"suggest-party-v1" и путь "/suggest-party" в списке post.
