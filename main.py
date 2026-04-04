@@ -138,6 +138,35 @@ def _amo_company_field_id(base_env: str) -> int | None:
     return _amo_lead_field_id(base_env)
 
 
+# В amo у полей «число» value в API должен быть numeric; пустая строка даёт 400 InvalidType.
+_AMO_CFV_NUMERIC_ROW_KEYS: frozenset[str] = frozenset(
+    {
+        "inn",
+        "kpp",
+        "ogrn",
+        "settlement_account",
+        "corr_account",
+        "bic",
+        "okpo",
+    }
+)
+
+
+def _amo_cfv_values_cell(row_key: str, val: str, *, include_empty: bool) -> dict[str, Any] | None:
+    """Одна ячейка values[0]; None — не включать поле в PATCH."""
+    if not val:
+        if not include_empty:
+            return None
+        if row_key in _AMO_CFV_NUMERIC_ROW_KEYS or row_key == "inn":
+            return None
+        return {"value": ""}
+    if row_key in _AMO_CFV_NUMERIC_ROW_KEYS:
+        compact = "".join(val.split())
+        if compact.isdigit():
+            return {"value": int(compact)}
+    return {"value": val}
+
+
 def _dadata_row_to_amo_cfv(
     row: dict[str, str],
     entity: Literal["lead", "company"],
@@ -173,11 +202,10 @@ def _dadata_row_to_amo_cfv(
         if fid is None:
             continue
         val = (row.get(row_key) or "").strip()
-        if not val and not include_empty:
+        cell = _amo_cfv_values_cell(row_key, val, include_empty=include_empty)
+        if cell is None:
             continue
-        if not val and row_key == "inn":
-            continue
-        out.append({"field_id": fid, "values": [{"value": val}]})
+        out.append({"field_id": fid, "values": [cell]})
     return out
 
 
