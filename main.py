@@ -558,7 +558,10 @@ async def amo_sync_lead_webhook(
             content={
                 "ok": False,
                 "reason": "INVALID_JSON",
-                "hint": "Нужен POST с Content-Type: application/json и телом JSON",
+                "hint": (
+                    "Тело должно быть валидным JSON. Подставьте числовой id сделки, без слов-заглушек: "
+                    '{"lead_id": 12345678}'
+                ),
             },
         )
 
