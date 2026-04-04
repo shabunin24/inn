@@ -1,0 +1,20 @@
+Готовые ID полей сделки (вставьте в настройки виджета / интеграции amo)
+================================================================================
+
+field_inn                  1303797     ИНН
+field_kpp                  1303799     КПП
+field_address              1001617     Адрес
+field_bank                 1303155     Банк (название из DaData, если есть)
+field_rs                   1303807     Расчётный счёт (в party часто пусто)
+field_corr                 1303805     Корреспондентский счёт (в party часто пусто)
+
+Опционально (если заведёте поля на сделке):
+field_ogrn, field_company_name, field_director, field_status,
+field_okpo, field_okved, field_registration_date, field_opf, field_bic (БИК)
+
+backend_url                https://inn-efz1.onrender.com
+x_api_key                  (ваш ключ, например test_key_1)
+
+Примечание: DaData findById/party обычно не возвращает р/с и к/с организации.
+Поля 1303807 и 1303805 заполнятся только если в ответе DaData появятся
+соответствующие данные (например, в блоке finance на вашем тарифе).

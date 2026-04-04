@@ -1,6 +1,12 @@
 """
 SaaS backend: ИНН → реквизиты компании (DaData).
 
+Публичное API: POST /company-by-inn (заголовок X-API-KEY).
+
+Вариант C (без виджета amo): POST /integrations/amo/webhook — вебхук из автоматизации amo
+с телом {"lead_id": <id>}; нужны AMOCRM_API_BASE, AMOCRM_ACCESS_TOKEN, DADATA_API_KEY,
+поле ИНН на сделке (AMO_FIELD_INN или значение по умолчанию в коде).
+
 Деплой на Render:
   - Environment (см. блок «Внешние API» ниже в коде)
   - Render подставляет PORT; для локали: uvicorn main:app --host 0.0.0.0 --port 10000
@@ -11,6 +17,7 @@ from __future__ import annotations
 
 import logging
 import os
+from datetime import datetime, timezone
 from contextlib import asynccontextmanager
 from typing import Annotated, Any
 
@@ -34,12 +41,93 @@ from pydantic import BaseModel, Field, field_validator
 #
 DADATA_API_KEY_HERE = ""
 
-# amoCRM (REST v4, для будущих вызовов из этого сервиса):
-#   AMOCRM_API_BASE — база без слэша на конце, например https://ВАШ_ПОДДОМЕН.amocrm.ru
-#   AMOCRM_ACCESS_TOKEN — долгоживущий токен (если будете ходить в API с бэкенда)
+# amoCRM — куда вставлять то, что выдаёт amo при создании виджета / интеграции
+#
+# 1) Только на сервере (Render → Environment — те же имена; не коммитить в git):
+#    AMOCRM_API_BASE      — URL аккаунта: https://ВАШ_ПОДДОМЕН.amocrm.ru (без / в конце)
+#    AMOCRM_ACCESS_TOKEN  — «долгоживущий ключ» / access token из блока «Ключи и доступы»
+#                            интеграции (нужен, если этот бэкенд будет вызывать REST API amo)
+#    AMOCRM_CLIENT_ID     — Client ID интеграции (если amo выдал; для OAuth с бэкенда)
+#    AMOCRM_CLIENT_SECRET — Secret интеграции (только сюда или в env, не в JS виджета)
+#
+# 2) В коде виджета (архив .zip, script.js / manifest — в кабинете amo, НЕ в этом репозитории):
+#    — URL вашего API: https://inn-efz1.onrender.com/company-by-inn
+#    — Заголовок X-API-KEY: значение из словаря API_KEYS ниже (например test_key_1) —
+#      это ВАШ ключ к бэкенду, его amo не выдаёт; придумываете вы и прописываете в виджете.
+#
+# 3) Секрет интеграции amo не вставляйте в публичный JS виджета — только env на Render или
+#    серверную часть; иначе любой сможет прочитать ключ в исходниках виджета.
 # ---------------------------------------------------------------------------
 AMOCRM_API_BASE = os.environ.get("AMOCRM_API_BASE", "").strip().rstrip("/")
 AMOCRM_ACCESS_TOKEN = os.environ.get("AMOCRM_ACCESS_TOKEN", "").strip()
+AMOCRM_CLIENT_ID = os.environ.get("AMOCRM_CLIENT_ID", "").strip()
+AMOCRM_CLIENT_SECRET = os.environ.get("AMOCRM_CLIENT_SECRET", "").strip()
+# Вебхук (вариант C): если задан — проверяем телом secret= или заголовок X-Webhook-Secret
+AMO_WEBHOOK_SECRET = os.environ.get("AMO_WEBHOOK_SECRET", "").strip()
+
+# ID полей сделки в amo → env можно переопределить; иначе значения из вашей вёрстки
+_DEFAULT_AMO_LEAD_FIELDS: dict[str, str] = {
+    "AMO_FIELD_INN": "1303797",
+    "AMO_FIELD_KPP": "1303799",
+    "AMO_FIELD_ADDRESS": "1001617",
+    "AMO_FIELD_BANK": "1303155",
+    "AMO_FIELD_RS": "1303807",
+    "AMO_FIELD_CORR": "1303805",
+}
+
+
+def _amo_lead_field_id(env_name: str) -> int | None:
+    v = os.environ.get(env_name, _DEFAULT_AMO_LEAD_FIELDS.get(env_name, "")).strip()
+    if not v:
+        return None
+    try:
+        return int(v)
+    except ValueError:
+        return None
+
+
+def _dadata_row_to_amo_lead_cfv(row: dict[str, str]) -> list[dict[str, Any]]:
+    """Собирает custom_fields_values для PATCH сделки."""
+    mapping: list[tuple[str, str]] = [
+        ("inn", "AMO_FIELD_INN"),
+        ("kpp", "AMO_FIELD_KPP"),
+        ("ogrn", "AMO_FIELD_OGRN"),
+        ("address", "AMO_FIELD_ADDRESS"),
+        ("bank_name", "AMO_FIELD_BANK"),
+        ("settlement_account", "AMO_FIELD_RS"),
+        ("corr_account", "AMO_FIELD_CORR"),
+        ("name", "AMO_FIELD_COMPANY_NAME"),
+        ("director", "AMO_FIELD_DIRECTOR"),
+        ("status", "AMO_FIELD_STATUS"),
+        ("okpo", "AMO_FIELD_OKPO"),
+        ("okved", "AMO_FIELD_OKVED"),
+        ("registration_date", "AMO_FIELD_REGISTRATION_DATE"),
+        ("opf", "AMO_FIELD_OPF"),
+        ("bic", "AMO_FIELD_BIC"),
+    ]
+    out: list[dict[str, Any]] = []
+    for row_key, env_name in mapping:
+        fid = _amo_lead_field_id(env_name)
+        if fid is None:
+            continue
+        val = (row.get(row_key) or "").strip()
+        if not val:
+            continue
+        out.append({"field_id": fid, "values": [{"value": val}]})
+    return out
+
+
+def _inn_from_lead_payload(lead: dict[str, Any], field_id: int) -> str:
+    for block in lead.get("custom_fields_values") or []:
+        if int(block.get("field_id") or 0) != field_id:
+            continue
+        for v in block.get("values") or []:
+            raw = v.get("value")
+            if raw is None:
+                continue
+            digits = "".join(c for c in str(raw) if c.isdigit())
+            return digits
+    return ""
 
 # Список API-ключей клиентов (лимиты и учёт вызовов)
 API_KEYS: dict[str, dict[str, int]] = {
@@ -63,16 +151,39 @@ def _resolve_dadata_api_key() -> str:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Один DadataAsync на процесс (внутри — общий httpx.AsyncClient к suggestions API)
     token = _resolve_dadata_api_key()
     secret = os.environ.get("DADATA_SECRET_KEY", "").strip() or None
+    amo_base = AMOCRM_API_BASE
+    amo_tok = AMOCRM_ACCESS_TOKEN
+    amo_client: httpx.AsyncClient | None = None
+    if amo_base and amo_tok:
+        amo_client = httpx.AsyncClient(
+            base_url=amo_base,
+            headers={
+                "Authorization": f"Bearer {amo_tok}",
+                "Content-Type": "application/json",
+                "Accept": "application/json",
+            },
+            timeout=httpx.Timeout(30.0, connect=10.0),
+        )
+
     if token:
         async with DadataAsync(token, secret=secret, timeout=30) as dadata:
             app.state.dadata = dadata
-            yield
+            app.state.amo_http = amo_client
+            try:
+                yield
+            finally:
+                if amo_client is not None:
+                    await amo_client.aclose()
     else:
         app.state.dadata = None
-        yield
+        app.state.amo_http = amo_client
+        try:
+            yield
+        finally:
+            if amo_client is not None:
+                await amo_client.aclose()
 
 
 app = FastAPI(title="INN → Company (DaData)", lifespan=lifespan)
@@ -123,6 +234,16 @@ class InnBody(BaseModel):
         return s
 
 
+class AmoWebhookBody(BaseModel):
+    """Тело для POST /integrations/amo/webhook (автоматизация amo: «Отправить вебхук»)."""
+
+    lead_id: int = Field(..., gt=0, description="ID сделки в amo")
+    secret: str | None = Field(
+        default=None,
+        description="Если задан AMO_WEBHOOK_SECRET — тот же текст здесь или в заголовке X-Webhook-Secret",
+    )
+
+
 def get_dadata_token() -> str:
     key = _resolve_dadata_api_key()
     if not key:
@@ -160,6 +281,52 @@ async def stats(api_key: Annotated[str, Depends(require_api_key)]):
     return {"limit": entry["limit"], "used": entry["used"]}
 
 
+def _opf_text(data: dict[str, Any]) -> str:
+    opf = data.get("opf")
+    if isinstance(opf, dict):
+        return str(opf.get("full") or opf.get("short") or "")
+    return str(opf or "").strip()
+
+
+def _okved_text(data: dict[str, Any]) -> str:
+    for row in data.get("okveds") or []:
+        if isinstance(row, dict) and row.get("main"):
+            code, name = row.get("code"), row.get("name")
+            parts = [p for p in (code, name) if p]
+            if parts:
+                return " ".join(parts)
+    ov = data.get("okved")
+    if isinstance(ov, dict):
+        code, name = ov.get("code"), ov.get("name")
+        parts = [p for p in (code, name) if p]
+        return " ".join(parts) if parts else ""
+    return str(ov or "").strip()
+
+
+def _reg_date_str(state: dict[str, Any]) -> str:
+    rd = state.get("registration_date")
+    if rd is None:
+        return ""
+    if isinstance(rd, (int, float)):
+        try:
+            dt = datetime.fromtimestamp(rd / 1000.0, tz=timezone.utc)
+            return dt.strftime("%d.%m.%Y")
+        except (OSError, ValueError, OverflowError):
+            return str(rd)
+    return str(rd).strip()
+
+
+def _finance_str(data: dict[str, Any], *keys: str) -> str:
+    fin = data.get("finance")
+    if not isinstance(fin, dict):
+        return ""
+    for k in keys:
+        v = fin.get(k)
+        if v is not None and str(v).strip():
+            return str(v).strip()
+    return ""
+
+
 def party_to_company(data: dict[str, Any]) -> dict[str, str]:
     name = (data.get("name") or {}).get("full_with_opf") or ""
     address = (data.get("address") or {}).get("value") or ""
@@ -167,6 +334,15 @@ def party_to_company(data: dict[str, Any]) -> dict[str, str]:
     director = management.get("name") or ""
     state = data.get("state") or {}
     status = state.get("status") or ""
+    bic_val = data.get("bic") or (data.get("bank") or {}).get("bic") or ""
+    bank_name = ""
+    if isinstance(data.get("bank"), dict):
+        bank_name = str(data["bank"].get("name") or "").strip()
+    # Р/с, к/с в типовой выдаче findById/party часто отсутствуют — пробуем finance.* при наличии.
+    rs = _finance_str(data, "account", "payment_account", "rs", "rasschet")
+    ks = _finance_str(data, "correspondent_account", "ks", "korr")
+    if not bank_name:
+        bank_name = _finance_str(data, "bank_name")
     return {
         "name": name,
         "inn": str(data.get("inn") or ""),
@@ -175,7 +351,50 @@ def party_to_company(data: dict[str, Any]) -> dict[str, str]:
         "address": address,
         "director": director,
         "status": str(status),
+        "okpo": str(data.get("okpo") or ""),
+        "okved": _okved_text(data),
+        "registration_date": _reg_date_str(state),
+        "bic": str(bic_val).strip(),
+        "opf": _opf_text(data),
+        "bank_name": bank_name,
+        "settlement_account": rs,
+        "corr_account": ks,
     }
+
+
+async def _party_company_for_inn(request: Request, inn: str) -> dict[str, str] | None:
+    """
+    Кеш или DaData → словарь реквизитов. None если организация не найдена.
+    Не меняет счётчики API_KEYS (для вебхука amo и внутренних вызовов).
+    """
+    if inn in CACHE:
+        return CACHE[inn]
+
+    dadata: DadataAsync | None = request.app.state.dadata
+    if dadata is None:
+        logger.error("DADATA_API_KEY отсутствовал при старте — перезапустите сервис")
+        raise HTTPException(status_code=500, detail="Сервис временно недоступен")
+
+    try:
+        suggestions = await dadata.find_by_id("party", inn)
+    except httpx.HTTPStatusError as e:
+        logger.exception("DaData HTTP error: %s", e)
+        raise HTTPException(status_code=500, detail="Ошибка при обращении к DaData") from e
+    except httpx.RequestError as e:
+        logger.exception("DaData недоступна: %s", e)
+        raise HTTPException(status_code=500, detail="Ошибка при обращении к DaData") from e
+    except Exception as e:  # noqa: BLE001
+        logger.exception("Неожиданная ошибка при запросе к DaData: %s", e)
+        raise HTTPException(status_code=500, detail="Ошибка при обращении к DaData") from e
+
+    suggestions = suggestions or []
+    if not suggestions:
+        return None
+
+    first = suggestions[0].get("data") or {}
+    company = party_to_company(first)
+    CACHE[inn] = company
+    return company
 
 
 @app.post("/company-by-inn")
@@ -190,38 +409,96 @@ async def company_by_inn(
 
     inn = body.inn
 
-    if inn in CACHE:
-        entry["used"] += 1
-        return CACHE[inn]
-
     get_dadata_token()  # проверка, что ключ задан (и 500, если нет)
-    dadata: DadataAsync | None = request.app.state.dadata
-    if dadata is None:
-        logger.error("DADATA_API_KEY отсутствовал при старте — перезапустите сервис")
-        raise HTTPException(status_code=500, detail="Сервис временно недоступен")
-
-    try:
-        # Эквивалент: dadata.find_by_id("party", inn) из dadata-py
-        suggestions = await dadata.find_by_id("party", inn)
-    except httpx.HTTPStatusError as e:
-        logger.exception("DaData HTTP error: %s", e)
-        raise HTTPException(status_code=500, detail="Ошибка при обращении к DaData") from e
-    except httpx.RequestError as e:
-        logger.exception("DaData недоступна: %s", e)
-        raise HTTPException(status_code=500, detail="Ошибка при обращении к DaData") from e
-    except Exception as e:  # noqa: BLE001
-        logger.exception("Неожиданная ошибка при запросе к DaData: %s", e)
-        raise HTTPException(status_code=500, detail="Ошибка при обращении к DaData") from e
-
-    suggestions = suggestions or []
-    if not suggestions:
+    company = await _party_company_for_inn(request, inn)
+    if company is None:
         return JSONResponse(status_code=404, content={"error": "NOT_FOUND"})
 
-    first = suggestions[0].get("data") or {}
-    company = party_to_company(first)
-    CACHE[inn] = company
     entry["used"] += 1
     return company
+
+
+def _check_amo_webhook_secret(
+    body_secret: str | None,
+    header_secret: str | None,
+) -> None:
+    if not AMO_WEBHOOK_SECRET:
+        return
+    ok = body_secret == AMO_WEBHOOK_SECRET or (header_secret or "").strip() == AMO_WEBHOOK_SECRET
+    if not ok:
+        raise HTTPException(status_code=403, detail="Неверный секрет вебхука")
+
+
+@app.post("/integrations/amo/webhook")
+async def amo_sync_lead_webhook(
+    body: AmoWebhookBody,
+    request: Request,
+    x_webhook_secret: Annotated[str | None, Header(alias="X-Webhook-Secret")] = None,
+):
+    """
+    Вариант C: без виджета. В amo — действие «Отправить вебхук» на этот URL,
+    JSON: {"lead_id": {{lead.id}}, "secret": "..."} (secret — если задан AMO_WEBHOOK_SECRET).
+    Читает ИНН из поля сделки (AMO_FIELD_INN), тянет DaData, PATCH сделки в amo.
+    """
+    _check_amo_webhook_secret(body.secret, x_webhook_secret)
+
+    amo: httpx.AsyncClient | None = getattr(request.app.state, "amo_http", None)
+    if amo is None:
+        raise HTTPException(
+            status_code=503,
+            detail="amoCRM не настроен: задайте AMOCRM_API_BASE и AMOCRM_ACCESS_TOKEN",
+        )
+
+    inn_fid = _amo_lead_field_id("AMO_FIELD_INN")
+    if inn_fid is None:
+        raise HTTPException(status_code=500, detail="Не задано поле ИНН (AMO_FIELD_INN)")
+
+    get_dadata_token()
+
+    try:
+        lr = await amo.get(f"/api/v4/leads/{body.lead_id}")
+        lr.raise_for_status()
+    except httpx.HTTPStatusError as e:
+        logger.warning("amo GET lead %s: %s", body.lead_id, e)
+        raise HTTPException(status_code=502, detail="Не удалось прочитать сделку в amo") from e
+    except httpx.RequestError as e:
+        logger.exception("amo недоступен: %s", e)
+        raise HTTPException(status_code=502, detail="Ошибка сети при обращении к amo") from e
+
+    lead = lr.json()
+    inn = _inn_from_lead_payload(lead, inn_fid)
+    if len(inn) not in (10, 12):
+        return JSONResponse(
+            status_code=200,
+            content={"ok": False, "reason": "BAD_INN", "lead_id": body.lead_id, "inn_digits": inn},
+        )
+
+    company = await _party_company_for_inn(request, inn)
+    if company is None:
+        return JSONResponse(
+            status_code=200,
+            content={"ok": False, "reason": "NOT_FOUND", "lead_id": body.lead_id, "inn": inn},
+        )
+
+    cfv = _dadata_row_to_amo_lead_cfv(company)
+    if not cfv:
+        return JSONResponse(
+            status_code=200,
+            content={"ok": False, "reason": "NO_MAPPED_FIELDS", "lead_id": body.lead_id},
+        )
+
+    patch_body = [{"id": body.lead_id, "custom_fields_values": cfv}]
+    try:
+        pr = await amo.patch("/api/v4/leads", json=patch_body)
+        pr.raise_for_status()
+    except httpx.HTTPStatusError as e:
+        logger.warning("amo PATCH lead %s: %s %s", body.lead_id, e, e.response.text[:500] if e.response else "")
+        raise HTTPException(status_code=502, detail="Не удалось обновить сделку в amo") from e
+    except httpx.RequestError as e:
+        logger.exception("amo недоступен при PATCH: %s", e)
+        raise HTTPException(status_code=502, detail="Ошибка сети при обновлении amo") from e
+
+    return {"ok": True, "lead_id": body.lead_id, "inn": inn, "fields_updated": len(cfv)}
 
 
 if __name__ == "__main__":

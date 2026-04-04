@@ -1,0 +1,27 @@
+.inn-dadata-widget {
+  font-size: 13px;
+  line-height: 1.4;
+}
+.inn-dadata-widget__hint {
+  margin: 0 0 10px 0;
+  font-size: 12px;
+  color: #666;
+}
+.inn-dadata-widget__row {
+  margin-bottom: 8px;
+}
+.inn-dadata-widget__input {
+  width: 100%;
+  box-sizing: border-box;
+  padding: 6px 8px;
+}
+.inn-dadata-widget__btn {
+  margin-top: 4px;
+  padding: 8px 12px;
+  cursor: pointer;
+}
+.inn-dadata-widget__msg {
+  margin-top: 8px;
+  color: #666;
+  font-size: 12px;
+}

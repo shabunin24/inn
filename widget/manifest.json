@@ -1,0 +1,100 @@
+{
+  "widget": {
+    "name": "widget.name",
+    "description": "widget.description",
+    "short_description": "widget.short_description",
+    "version": "1.0.0",
+    "interface_version": 2,
+    "init_once": true,
+    "locale": ["ru"],
+    "installation": true
+  },
+  "locations": ["lcard-1", "comcard-1", "settings"],
+  "settings": [
+    {
+      "name": "backend_url",
+      "type": "text",
+      "required": true
+    },
+    {
+      "name": "x_api_key",
+      "type": "text",
+      "required": true
+    },
+    {
+      "name": "field_inn",
+      "type": "text",
+      "required": true
+    },
+    {
+      "name": "field_company_name",
+      "type": "text",
+      "required": false
+    },
+    {
+      "name": "field_kpp",
+      "type": "text",
+      "required": false
+    },
+    {
+      "name": "field_ogrn",
+      "type": "text",
+      "required": false
+    },
+    {
+      "name": "field_bic",
+      "type": "text",
+      "required": false
+    },
+    {
+      "name": "field_bank",
+      "type": "text",
+      "required": false
+    },
+    {
+      "name": "field_rs",
+      "type": "text",
+      "required": false
+    },
+    {
+      "name": "field_corr",
+      "type": "text",
+      "required": false
+    },
+    {
+      "name": "field_address",
+      "type": "text",
+      "required": false
+    },
+    {
+      "name": "field_director",
+      "type": "text",
+      "required": false
+    },
+    {
+      "name": "field_status",
+      "type": "text",
+      "required": false
+    },
+    {
+      "name": "field_okpo",
+      "type": "text",
+      "required": false
+    },
+    {
+      "name": "field_okved",
+      "type": "text",
+      "required": false
+    },
+    {
+      "name": "field_registration_date",
+      "type": "text",
+      "required": false
+    },
+    {
+      "name": "field_opf",
+      "type": "text",
+      "required": false
+    }
+  ]
+}
