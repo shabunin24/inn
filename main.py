@@ -18,6 +18,8 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
+from urllib.parse import parse_qs
 from datetime import datetime, timezone
 from contextlib import asynccontextmanager
 from typing import Annotated, Any
@@ -313,6 +315,22 @@ def extract_secret_from_amo_webhook_payload(data: Any) -> str | None:
     return str(s)
 
 
+def _recover_lead_id_from_broken_body(text: str) -> dict[str, Any] | None:
+    """
+    amo иногда шлёт битый JSON: плейсхолдер не подставился, лишние кавычки и т.п.
+    Тогда json.loads падает около «column 13» сразу после "lead_id":
+    """
+    for pat in (
+        r'"lead_id"\s*:\s*(\d{1,15})\b',
+        r"'lead_id'\s*:\s*(\d{1,15})\b",
+        r'"lead_id"\s*:\s*"(\d{1,15})"',
+    ):
+        m = re.search(pat, text, flags=re.IGNORECASE)
+        if m:
+            return {"lead_id": int(m.group(1))}
+    return None
+
+
 def _parse_amo_webhook_json_body(raw: bytes, content_type: str) -> Any | None:
     if not raw or not raw.strip():
         return {}
@@ -320,12 +338,25 @@ def _parse_amo_webhook_json_body(raw: bytes, content_type: str) -> Any | None:
     if not text:
         return {}
     ct = (content_type or "").lower()
+
+    if "application/x-www-form-urlencoded" in ct:
+        qs = parse_qs(text, keep_blank_values=True)
+        lid = (qs.get("lead_id") or qs.get("id") or [None])[0]
+        if lid and str(lid).strip().isdigit():
+            return {"lead_id": int(str(lid).strip())}
+        logger.warning("amo webhook: form-urlencoded без числового lead_id")
+        return None
+
     if "application/json" not in ct and not text.startswith(("{", "[")):
         logger.warning("amo webhook: не JSON (Content-Type=%s, первые символы не {/[)", content_type)
         return None
     try:
         return json.loads(text)
     except json.JSONDecodeError as e:
+        recovered = _recover_lead_id_from_broken_body(text)
+        if recovered:
+            logger.warning("amo webhook: JSON невалиден (%s), восстановлен lead_id из текста", e)
+            return recovered
         logger.warning("amo webhook: ошибка JSON: %s", e)
         return None
 
