@@ -729,7 +729,12 @@ def limit_exceeded_response() -> JSONResponse:
 
 @app.get("/")
 async def root():
-    return {"status": "ok"}
+    """Проверка живости и что задеплоена актуальная main (есть ли suggest-party)."""
+    return {
+        "status": "ok",
+        "build": "suggest-party-v1",
+        "post": ["/company-by-inn", "/suggest-party", "/integrations/amo/webhook"],
+    }
 
 
 @app.get("/stats")
