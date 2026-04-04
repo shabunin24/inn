@@ -227,6 +227,35 @@ async def _resolve_inn_for_webhook(
     return _inn_from_lead_payload(lead, lead_inn_fid)
 
 
+async def _amo_enrich_lead_with_companies_if_needed(
+    amo: httpx.AsyncClient,
+    lead: dict[str, Any],
+    lead_id: int,
+) -> dict[str, Any]:
+    """
+    Список сделок (filter/query) часто отдаёт карточку без _embedded.companies.
+    Тогда один запрос GET с with=companies подтягивает связи для чтения ИНН с компании.
+    """
+    if _amo_linked_company_ids(lead):
+        return lead
+    try:
+        r = await amo.get(f"/api/v4/leads/{lead_id}", params={"with": "companies"})
+        r.raise_for_status()
+    except (httpx.HTTPStatusError, httpx.RequestError) as e:
+        logger.warning("amo GET lead %s with=companies: %s", lead_id, e)
+        return lead
+    if r.status_code == 204 or not (r.text or "").strip():
+        return lead
+    try:
+        data = r.json()
+    except json.JSONDecodeError:
+        return lead
+    if isinstance(data, dict) and _amo_linked_company_ids(data):
+        logger.info("amo: для сделки %s подгружен _embedded.companies", lead_id)
+        return data
+    return lead
+
+
 def _inn_from_lead_payload(lead: dict[str, Any], field_id: int) -> str:
     cfv = lead.get("custom_fields_values")
     if not isinstance(cfv, list):
@@ -295,7 +324,7 @@ async def _amo_fetch_lead_raw(amo: httpx.AsyncClient, lead_id: int) -> dict[str,
     amo: GET /api/v4/leads/{id} — при отсутствии сделки официально отдаёт 204 (без тела).
     Далее: filter[id][], затем query= (поиск по полям, подхватит название «Сделка #…»).
     """
-    lr = await amo.get(f"/api/v4/leads/{lead_id}")
+    lr = await amo.get(f"/api/v4/leads/{lead_id}", params={"with": "companies"})
     lr.raise_for_status()
 
     if lr.status_code != 204 and (lr.text or "").strip():
@@ -847,6 +876,8 @@ async def amo_sync_lead_webhook(
     if lead is None:
         logger.warning("amo GET lead %s: неожиданная форма ответа %s", lead_id, type(lead_raw).__name__)
         raise HTTPException(status_code=502, detail="Неожиданный ответ amo при чтении сделки")
+
+    lead = await _amo_enrich_lead_with_companies_if_needed(amo, lead, lead_id)
 
     inn = await _resolve_inn_for_webhook(amo, lead, inn_fid)
     if len(inn) not in (10, 12):
