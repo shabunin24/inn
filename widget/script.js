@@ -42,10 +42,8 @@ define(['jquery'], function ($) {
     return null;
   }
 
-  function extractInnFromModel(model, fieldId) {
-    if (!model || !fieldId) return '';
-    var cfv = model.get('custom_fields_values');
-    if (!cfv || !cfv.length) return '';
+  function extractInnFromCfv(cfv, fieldId) {
+    if (!fieldId || !cfv || !cfv.length) return '';
     var row = null;
     for (var i = 0; i < cfv.length; i++) {
       if (Number(cfv[i].field_id) === Number(fieldId)) {
@@ -56,6 +54,46 @@ define(['jquery'], function ($) {
     if (!row || !row.values || !row.values.length) return '';
     var v = row.values[0].value;
     return String(v == null ? '' : v).replace(/\D/g, '');
+  }
+
+  function extractInnFromModel(model, fieldId) {
+    if (!model || !fieldId) return '';
+    return extractInnFromCfv(model.get('custom_fields_values'), fieldId);
+  }
+
+  /**
+   * На сделке ИНН часто в блоке компании (_embedded.companies), а не в полях сделки.
+   * patchMeta: если ИНН с компании — PATCH /companies/{id}, иначе PATCH сделки.
+   */
+  function resolveInnAndPatch(ctx, model, settings) {
+    var leadFid = parseInt(String(settings.field_inn || '').trim(), 10);
+    var compFid = parseInt(String(settings.field_inn_company || '').trim(), 10) || leadFid;
+    if (!leadFid || !model) return { inn: '', patchMeta: null };
+
+    if (ctx.kind === 'companies') {
+      var innC = extractInnFromCfv(model.get('custom_fields_values'), compFid);
+      if (innC.length !== 10 && innC.length !== 12) innC = extractInnFromCfv(model.get('custom_fields_values'), leadFid);
+      return { inn: innC, patchMeta: null };
+    }
+
+    var inn = extractInnFromCfv(model.get('custom_fields_values'), leadFid);
+    if (inn.length === 10 || inn.length === 12) return { inn: inn, patchMeta: null };
+    inn = extractInnFromCfv(model.get('custom_fields_values'), compFid);
+    if (inn.length === 10 || inn.length === 12) return { inn: inn, patchMeta: null };
+
+    var emb = model.get('_embedded');
+    if (emb && emb.companies && emb.companies.length) {
+      for (var j = 0; j < emb.companies.length; j++) {
+        var co = emb.companies[j];
+        if (!co) continue;
+        inn = extractInnFromCfv(co.custom_fields_values, compFid);
+        if (inn.length !== 10 && inn.length !== 12) inn = extractInnFromCfv(co.custom_fields_values, leadFid);
+        if ((inn.length === 10 || inn.length === 12) && co.id) {
+          return { inn: inn, patchMeta: { kind: 'companies', id: co.id } };
+        }
+      }
+    }
+    return { inn: '', patchMeta: null };
   }
 
   /** Сделка: только доп. поля. Компания: имя + доп. поля. */
@@ -210,7 +248,7 @@ define(['jquery'], function ($) {
       });
   }
 
-  function runPipeline(self, settings, ctx, inn, fromButton) {
+  function runPipeline(self, settings, ctx, inn, fromButton, patchMeta) {
     var L = function (k, fb) {
       return tr(self, k, fb);
     };
@@ -222,6 +260,9 @@ define(['jquery'], function ($) {
       if (fromButton) alert(L('err_inn', 'ИНН из 10 или 12 цифр.'));
       return;
     }
+
+    var effKind = patchMeta && patchMeta.kind ? patchMeta.kind : ctx.kind;
+    var effId = patchMeta && patchMeta.id != null ? patchMeta.id : ctx.id;
 
     var base = String(settings.backend_url).trim().replace(/\/+$/, '');
     var url = base + '/company-by-inn';
@@ -261,13 +302,13 @@ define(['jquery'], function ($) {
         return r.body;
       })
       .then(function (data) {
-        var payload = buildAmoPayload(ctx.kind, data, settings);
+        var payload = buildAmoPayload(effKind, data, settings);
         if (!payload) {
           throw new Error(
             'Нет полей для записи: укажите ID доп. полей сделки/компании в настройках виджета.',
           );
         }
-        var apiPath = ctx.kind === 'leads' ? '/api/v4/leads/' : '/api/v4/companies/';
+        var apiPath = effKind === 'leads' ? '/api/v4/leads/' : '/api/v4/companies/';
         var deferred = $.Deferred();
         if (typeof self.$authorizedAjax !== 'function') {
           deferred.reject(new Error('Нет $authorizedAjax'));
@@ -275,7 +316,7 @@ define(['jquery'], function ($) {
         }
         self
           .$authorizedAjax({
-            url: apiPath + ctx.id,
+            url: apiPath + effId,
             method: 'PATCH',
             contentType: 'application/json',
             data: JSON.stringify(payload),
@@ -314,15 +355,21 @@ define(['jquery'], function ($) {
     if (self._innDadataModel && self._innDadataHandler) {
       try {
         self._innDadataModel.off('change:custom_fields_values', self._innDadataHandler);
+        self._innDadataModel.off('change', self._innDadataHandler);
       } catch (e) {
         /* ignore */
       }
     }
     self._innDadataModel = null;
     self._innDadataHandler = null;
+    self._innDadataLastProcessedInn = '';
     if (self._innDadataDebounce) {
       clearTimeout(self._innDadataDebounce);
       self._innDadataDebounce = null;
+    }
+    if (self._innPollTimer) {
+      clearInterval(self._innPollTimer);
+      self._innPollTimer = null;
     }
   }
 
@@ -337,19 +384,39 @@ define(['jquery'], function ($) {
     if (!ctx || !ctx.model) return;
 
     self._innDadataModel = ctx.model;
+    self._innDadataLastProcessedInn = '';
     self._innDadataHandler = function () {
       if (window.__innDadataBusy) return;
       var c = currentCardContext();
       if (!c || c.id !== ctx.id) return;
       clearTimeout(self._innDadataDebounce);
       self._innDadataDebounce = setTimeout(function () {
-        var inn = extractInnFromModel(self._innDadataModel, innFid);
-        if (inn.length !== 10 && inn.length !== 12) return;
-        runPipeline(self, settings, c, inn, false);
-      }, 400);
+        var resolved = resolveInnAndPatch(c, self._innDadataModel, settings);
+        var inn = resolved.inn;
+        if (inn.length !== 10 && inn.length !== 12) {
+          self._innDadataLastProcessedInn = '';
+          return;
+        }
+        if (inn === self._innDadataLastProcessedInn) return;
+        self._innDadataLastProcessedInn = inn;
+        runPipeline(self, settings, c, inn, false, resolved.patchMeta);
+      }, 550);
     };
 
-    ctx.model.on('change:custom_fields_values', self._innDadataHandler);
+    ctx.model.on('change', self._innDadataHandler);
+
+    if (ctx.kind === 'leads') {
+      self._innPollTimer = setInterval(function () {
+        if (window.__innDadataBusy) return;
+        var cc = currentCardContext();
+        if (!cc || cc.id !== ctx.id || !self._innDadataModel) return;
+        var r = resolveInnAndPatch(cc, self._innDadataModel, settings);
+        if (r.inn.length !== 10 && r.inn.length !== 12) return;
+        if (r.inn === self._innDadataLastProcessedInn) return;
+        self._innDadataLastProcessedInn = r.inn;
+        runPipeline(self, settings, cc, r.inn, false, r.patchMeta);
+      }, 2500);
+    }
   }
 
   return function () {
@@ -382,7 +449,9 @@ define(['jquery'], function ($) {
             var ctx = currentCardContext();
             if (!ctx) return;
             var st = self.get_settings() || {};
-            runPipeline(self, st, ctx, inn, false);
+            var res = resolveInnAndPatch(ctx, ctx.model, st);
+            var pm = res.inn === inn ? res.patchMeta : null;
+            runPipeline(self, st, ctx, inn, false, pm);
           });
         $(document)
           .off('click.innDadataSuggestClose')
@@ -402,15 +471,19 @@ define(['jquery'], function ($) {
               alert(L('err_card', 'Откройте сохранённую карточку сделки или компании.'));
               return;
             }
-            var innFid = parseInt(String(settings.field_inn || '').trim(), 10);
-            var inn = '';
-            if (ctx.model && innFid) {
-              inn = extractInnFromModel(ctx.model, innFid);
+            var fromInput = ($('.js-inn-dadata-input').val() || '').replace(/\D/g, '');
+            var resolved = resolveInnAndPatch(ctx, ctx.model, settings);
+            var inn = resolved.inn;
+            var pm = resolved.patchMeta;
+            if (fromInput.length === 10 || fromInput.length === 12) {
+              inn = fromInput;
+              pm = null;
             }
-            if (!inn) {
-              inn = ($('.js-inn-dadata-input').val() || '').replace(/\D/g, '');
+            if (inn.length !== 10 && inn.length !== 12) {
+              alert(L('err_inn', 'ИНН из 10 или 12 цифр.'));
+              return;
             }
-            runPipeline(self, settings, ctx, inn, true);
+            runPipeline(self, settings, ctx, inn, true, pm);
           });
         return true;
       },
