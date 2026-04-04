@@ -63,6 +63,36 @@ DADATA_API_KEY_HERE = ""
 # ---------------------------------------------------------------------------
 AMOCRM_API_BASE = os.environ.get("AMOCRM_API_BASE", "").strip().rstrip("/")
 AMOCRM_ACCESS_TOKEN = os.environ.get("AMOCRM_ACCESS_TOKEN", "").strip()
+
+
+def _env_amocrm_base() -> str:
+    return os.environ.get("AMOCRM_API_BASE", "").strip().rstrip("/")
+
+
+def _env_amocrm_token() -> str:
+    """Токен из env; снимаем оборачивающие кавычки (часто копируют в Render с \"...\")."""
+    t = os.environ.get("AMOCRM_ACCESS_TOKEN", "").strip()
+    if len(t) >= 2 and t[0] == t[-1] and t[0] in "\"'":
+        t = t[1:-1].strip()
+    return t
+
+
+def _amo_non_json_error_detail(response: httpx.Response) -> str:
+    """Пояснение, если вместо JSON пришла HTML-страница или мусор."""
+    ct = (response.headers.get("content-type") or "").lower()
+    body = (response.text or "")[:400].lower()
+    st = response.status_code
+    base = (
+        f"amo вернул не JSON (HTTP {st}). Проверьте AMOCRM_API_BASE и долгосрочный токен "
+        f"из той же интеграции и аккаунта, что и сделки (например https://shabuninaleksei.amocrm.ru)."
+    )
+    if "text/html" in ct or "<!doctype" in body or "<html" in body:
+        return (
+            base
+            + " Сейчас в ответе похоже HTML (часто неверный URL, истёкший токен или лишние кавычки "
+            "вокруг значения AMOCRM_ACCESS_TOKEN на Render)."
+        )
+    return base
 AMOCRM_CLIENT_ID = os.environ.get("AMOCRM_CLIENT_ID", "").strip()
 AMOCRM_CLIENT_SECRET = os.environ.get("AMOCRM_CLIENT_SECRET", "").strip()
 # Вебхук (вариант C): если задан — проверяем телом secret= или заголовок X-Webhook-Secret
@@ -183,8 +213,8 @@ def _resolve_dadata_api_key() -> str:
 async def lifespan(app: FastAPI):
     token = _resolve_dadata_api_key()
     secret = os.environ.get("DADATA_SECRET_KEY", "").strip() or None
-    amo_base = AMOCRM_API_BASE
-    amo_tok = AMOCRM_ACCESS_TOKEN
+    amo_base = _env_amocrm_base()
+    amo_tok = _env_amocrm_token()
     amo_client: httpx.AsyncClient | None = None
     if amo_base and amo_tok:
         amo_client = httpx.AsyncClient(
@@ -195,6 +225,7 @@ async def lifespan(app: FastAPI):
                 "Accept": "application/json",
             },
             timeout=httpx.Timeout(30.0, connect=10.0),
+            follow_redirects=False,
         )
 
     if token:
@@ -635,6 +666,16 @@ async def amo_sync_lead_webhook(
         lr = await amo.get(f"/api/v4/leads/{lead_id}")
         lr.raise_for_status()
     except httpx.HTTPStatusError as e:
+        if e.response is not None and 300 <= e.response.status_code < 400:
+            loc = e.response.headers.get("location", "")[:200]
+            logger.warning("amo GET lead %s: редирект %s → %s", lead_id, e.response.status_code, loc)
+            raise HTTPException(
+                status_code=502,
+                detail=(
+                    "amo ответил редиректом вместо JSON. Проверьте AMOCRM_API_BASE: "
+                    "должен быть полный URL аккаунта, например https://ВАШ_ПОДДОМЕН.amocrm.ru без пути /api."
+                ),
+            ) from e
         logger.warning("amo GET lead %s: %s", lead_id, e)
         raise HTTPException(status_code=502, detail="Не удалось прочитать сделку в amo") from e
     except httpx.RequestError as e:
@@ -644,11 +685,16 @@ async def amo_sync_lead_webhook(
     try:
         lead_raw = lr.json()
     except json.JSONDecodeError as e:
-        logger.warning("amo GET lead %s: ответ не JSON: %s", lead_id, e)
-        raise HTTPException(
-            status_code=502,
-            detail="amo вернул не JSON (проверьте AMOCRM_API_BASE и токен)",
-        ) from e
+        prefix = (lr.text or "")[:120].replace("\n", " ")
+        logger.warning(
+            "amo GET lead %s: не JSON status=%s ct=%s err=%s prefix=%r",
+            lead_id,
+            lr.status_code,
+            lr.headers.get("content-type"),
+            e,
+            prefix,
+        )
+        raise HTTPException(status_code=502, detail=_amo_non_json_error_detail(lr)) from e
 
     lead = _normalize_amo_single_lead_json(lead_raw)
     if lead is None:
