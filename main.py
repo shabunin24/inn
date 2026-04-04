@@ -198,48 +198,88 @@ def _normalize_amo_single_lead_json(raw: Any) -> dict[str, Any] | None:
     return raw
 
 
+def _amo_embedded_leads(data: dict[str, Any]) -> list[dict[str, Any]]:
+    emb = data.get("_embedded")
+    if not isinstance(emb, dict):
+        return []
+    ls = emb.get("leads")
+    if not isinstance(ls, list):
+        return []
+    return [x for x in ls if isinstance(x, dict)]
+
+
+def _amo_find_lead_in_list_payload(data: dict[str, Any], lead_id: int) -> dict[str, Any] | None:
+    for row in _amo_embedded_leads(data):
+        rid = row.get("id")
+        if rid is None:
+            continue
+        try:
+            if int(rid) == int(lead_id):
+                return row
+        except (TypeError, ValueError):
+            continue
+    return None
+
+
 async def _amo_fetch_lead_raw(amo: httpx.AsyncClient, lead_id: int) -> dict[str, Any]:
     """
-    GET /api/v4/leads/{id}. У части аккаунтов amo отвечает 204 без тела — тогда
-    GET /api/v4/leads?filter[id][]=id&limit=1.
+    amo: GET /api/v4/leads/{id} — при отсутствии сделки официально отдаёт 204 (без тела).
+    Далее: filter[id][], затем query= (поиск по полям, подхватит название «Сделка #…»).
     """
     lr = await amo.get(f"/api/v4/leads/{lead_id}")
     lr.raise_for_status()
 
-    lead_raw: dict[str, Any] | None = None
     if lr.status_code != 204 and (lr.text or "").strip():
         try:
-            parsed = lr.json()
-            if isinstance(parsed, dict):
-                lead_raw = parsed
+            one = lr.json()
+            if isinstance(one, dict) and one.get("id") is not None:
+                try:
+                    if int(one["id"]) == int(lead_id):
+                        return one
+                except (TypeError, ValueError):
+                    pass
         except json.JSONDecodeError:
             logger.warning("amo GET /api/v4/leads/%s: тело не JSON", lead_id)
 
-    if lead_raw is None:
-        logger.info("amo GET /api/v4/leads/%s: пусто или не JSON → filter[id][]", lead_id)
-        lr2 = await amo.get(
-            "/api/v4/leads",
-            params=[("filter[id][]", str(lead_id)), ("limit", "1")],
-        )
-        lr2.raise_for_status()
-        if lr2.status_code == 204 or not (lr2.text or "").strip():
-            raise HTTPException(
-                status_code=502,
-                detail=(
-                    f"amo вернул пустой ответ для сделки {lead_id} (и по filter[id][]). "
-                    "Проверьте id, поддомен и права интеграции на сделки."
-                ),
-            )
+    logger.info("amo: filter[id][] для сделки %s", lead_id)
+    lr2 = await amo.get(
+        "/api/v4/leads",
+        params=[("filter[id][]", str(lead_id)), ("limit", "1")],
+    )
+    lr2.raise_for_status()
+    if (lr2.text or "").strip():
         try:
-            parsed2 = lr2.json()
-        except json.JSONDecodeError as e:
-            logger.warning("amo GET leads filter: не JSON: %s", e)
-            raise HTTPException(status_code=502, detail=_amo_non_json_error_detail(lr2)) from e
-        if not isinstance(parsed2, dict):
-            raise HTTPException(status_code=502, detail="Неожиданный ответ amo при чтении сделки")
-        lead_raw = parsed2
+            data2 = lr2.json()
+            if isinstance(data2, dict):
+                found = _amo_find_lead_in_list_payload(data2, lead_id)
+                if found:
+                    return found
+        except json.JSONDecodeError:
+            logger.warning("amo GET leads filter: не JSON")
 
-    return lead_raw
+    logger.info("amo: query=%s (поиск по полям сделки)", lead_id)
+    lr3 = await amo.get("/api/v4/leads", params={"query": str(lead_id), "limit": 50})
+    lr3.raise_for_status()
+    if (lr3.text or "").strip():
+        try:
+            data3 = lr3.json()
+            if isinstance(data3, dict):
+                found = _amo_find_lead_in_list_payload(data3, lead_id)
+                if found:
+                    return found
+        except json.JSONDecodeError:
+            logger.warning("amo GET leads query: не JSON")
+
+    raise HTTPException(
+        status_code=502,
+        detail=(
+            f"Сделку {lead_id} API amo не вернуло. По документации amo ответ 204 на GET /api/v4/leads/{{id}} "
+            "означает, что сделки с таким ID нет для этого токена. Проверьте: "
+            "1) откройте карточку сделки и посмотрите id в URL (не только # в названии); "
+            "2) amo → ваша интеграция → выданные доступы — должно быть право на чтение сделок; "
+            "3) долгосрочный токен из этого же аккаунта (поддомен в AMOCRM_API_BASE)."
+        ),
+    )
 
 
 # Список API-ключей клиентов (лимиты и учёт вызовов)
