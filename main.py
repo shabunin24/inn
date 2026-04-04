@@ -279,7 +279,33 @@ async def _resolve_inn_for_webhook(
     lead: dict[str, Any],
     lead_inn_fid: int,
 ) -> _InnWebhookResolution:
-    """ИНН со сделки или со связанной компании; куда писать реквизиты DaData — в ту же сущность."""
+    """
+    ИНН для DaData: сначала связанная компания (в карточке сделки ИНН обычно там;
+    иначе после смены ИНН у компании вебхук брал бы старое значение со сделки или из скана полей).
+    Потом — сделка.
+    """
+    comp_fid = _amo_company_inn_field_id()
+    if comp_fid is not None:
+        for cid in _amo_linked_company_ids(lead):
+            comp = await _amo_fetch_company_dict(amo, cid)
+            if comp is None:
+                continue
+            inn = _inn_from_lead_payload(comp, comp_fid)
+            if len(inn) in (10, 12):
+                logger.info("amo: ИНН взят с компании id=%s (field_id=%s)", cid, comp_fid)
+                return _InnWebhookResolution(inn, "company", cid)
+            inn = _scan_entity_custom_fields_for_inn_digits(comp)
+            if len(inn) in (10, 12):
+                logger.info("amo: ИНН на компании id=%s найден по разбору полей (10/12 цифр)", cid)
+                return _InnWebhookResolution(inn, "company", cid)
+            inn = _inn_from_entity_name(comp)
+            if len(inn) in (10, 12):
+                logger.info("amo: ИНН из названия компании id=%s", cid)
+                return _InnWebhookResolution(inn, "company", cid)
+            cfv_dbg = comp.get("custom_fields_values")
+            cfv_n = len(cfv_dbg) if isinstance(cfv_dbg, list) else "null"
+            logger.warning("amo: компания id=%s — ИНН не извлечён (custom_fields_values len=%s)", cid, cfv_n)
+
     inn = _inn_from_lead_payload(lead, lead_inn_fid)
     if len(inn) in (10, 12):
         return _InnWebhookResolution(inn, "lead", None)
@@ -292,29 +318,6 @@ async def _resolve_inn_for_webhook(
         logger.info("amo: ИНН из названия сделки")
         return _InnWebhookResolution(inn, "lead", None)
 
-    comp_fid = _amo_company_inn_field_id()
-    if comp_fid is None:
-        inn = _inn_from_lead_payload(lead, lead_inn_fid)
-        return _InnWebhookResolution(inn, "lead", None)
-    for cid in _amo_linked_company_ids(lead):
-        comp = await _amo_fetch_company_dict(amo, cid)
-        if comp is None:
-            continue
-        inn = _inn_from_lead_payload(comp, comp_fid)
-        if len(inn) in (10, 12):
-            logger.info("amo: ИНН взят с компании id=%s (field_id=%s)", cid, comp_fid)
-            return _InnWebhookResolution(inn, "company", cid)
-        inn = _scan_entity_custom_fields_for_inn_digits(comp)
-        if len(inn) in (10, 12):
-            logger.info("amo: ИНН на компании id=%s найден по разбору полей (10/12 цифр)", cid)
-            return _InnWebhookResolution(inn, "company", cid)
-        inn = _inn_from_entity_name(comp)
-        if len(inn) in (10, 12):
-            logger.info("amo: ИНН из названия компании id=%s", cid)
-            return _InnWebhookResolution(inn, "company", cid)
-        cfv_dbg = comp.get("custom_fields_values")
-        cfv_n = len(cfv_dbg) if isinstance(cfv_dbg, list) else "null"
-        logger.warning("amo: компания id=%s — ИНН не извлечён (custom_fields_values len=%s)", cid, cfv_n)
     inn = _inn_from_lead_payload(lead, lead_inn_fid)
     return _InnWebhookResolution(inn, "lead", None)
 
