@@ -162,15 +162,39 @@ define(['jquery'], function ($) {
   /** Сделка: только доп. поля. Компания: имя + доп. поля. */
   function buildAmoPayload(kind, dadataRow, settings) {
     var cfv = [];
+    /** Поля типа «число» в amo (как linked-form__field-numeric) — value должен быть number в JSON, не строка. */
+    function amoCoercedValue(fieldKey, val) {
+      var s = String(val == null ? '' : val).trim();
+      if (!s.length) return null;
+      var c = s.replace(/\s/g, '');
+      var onlyDigits = /^\d+$/.test(c);
+      if (fieldKey === 'field_rs' || fieldKey === 'field_corr') {
+        if (onlyDigits) {
+          var nAcc = parseInt(c, 10);
+          if (Number.isSafeInteger(nAcc)) return nAcc;
+        }
+        return s;
+      }
+      if (
+        fieldKey === 'field_inn' ||
+        fieldKey === 'field_kpp' ||
+        fieldKey === 'field_ogrn' ||
+        fieldKey === 'field_bic' ||
+        fieldKey === 'field_okpo'
+      ) {
+        if (onlyDigits) return parseInt(c, 10);
+      }
+      return s;
+    }
     function add(fieldKey, val) {
       var raw = settings[fieldKey];
       if (!raw || !String(raw).trim()) return;
       var fid = parseInt(String(raw).trim(), 10);
       if (!fid) return;
       if (val === undefined || val === null) return;
-      var s = String(val).trim();
-      if (!s.length) return;
-      cfv.push({ field_id: fid, values: [{ value: s }] });
+      var v = amoCoercedValue(fieldKey, val);
+      if (v === null || v === '') return;
+      cfv.push({ field_id: fid, values: [{ value: v }] });
     }
 
     add('field_inn', dadataRow.inn);
