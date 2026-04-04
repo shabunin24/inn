@@ -441,13 +441,19 @@ async def lifespan(app: FastAPI):
     amo_tok = _env_amocrm_token()
     amo_client: httpx.AsyncClient | None = None
     if amo_base and amo_tok:
+        # Как в официальном PHP-клиенте (amocrm-api-php): User-Agent и X-Client-UUID с ID интеграции.
+        # Без X-Client-UUID часть аккаунтов отдаёт урезанные ответы (см. getBaseHeaders в AmoCRMApiRequest).
+        amo_headers: dict[str, str] = {
+            "Authorization": f"Bearer {amo_tok}",
+            "Accept": "application/json",
+            "User-Agent": "inn-dadata-backend/1.0",
+        }
+        amo_client_uuid = os.environ.get("AMOCRM_CLIENT_ID", "").strip()
+        if amo_client_uuid:
+            amo_headers["X-Client-UUID"] = amo_client_uuid
         amo_client = httpx.AsyncClient(
             base_url=amo_base,
-            headers={
-                "Authorization": f"Bearer {amo_tok}",
-                "Content-Type": "application/json",
-                "Accept": "application/json",
-            },
+            headers=amo_headers,
             timeout=httpx.Timeout(30.0, connect=10.0),
             follow_redirects=False,
         )
