@@ -521,6 +521,20 @@ def _check_amo_webhook_secret(
         raise HTTPException(status_code=403, detail="Неверный секрет вебхука")
 
 
+@app.get("/integrations/amo/webhook")
+async def amo_webhook_get_info():
+    """
+    Подсказка: открытие URL в браузере шлёт GET — для работы нужен POST + JSON.
+    Логи Render с «405» на этом пути чаще всего из‑за проверки ссылки в браузере.
+    """
+    return {
+        "hint": "Этот адрес вызывается методом POST из amo или curl, не из адресной строки браузера.",
+        "method": "POST",
+        "content_type": "application/json",
+        "example_body": {"lead_id": 12345},
+    }
+
+
 @app.post("/integrations/amo/webhook")
 async def amo_sync_lead_webhook(
     request: Request,
