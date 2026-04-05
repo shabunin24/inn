@@ -7,8 +7,7 @@
  * @see https://www.amocrm.ru/developers/content/crm_platform/api-v4
  * @see https://github.com/amocrm/amocrm-api-php
  *
- * Внешний бэкенд (DaData): в доках amo для кросс-домена к стороннему URL рекомендуют self.crm_post;
- * здесь используется fetch на HTTPS при настроенном CORS на сервере.
+ * Внешний бэкенд: сначала fetch (CORS allow_origins=* на FastAPI), при сбое — self.crm_post (прокси amo).
  */
 define(['jquery'], function ($) {
   'use strict';
@@ -86,9 +85,11 @@ define(['jquery'], function ($) {
   }
 
   /**
-   * Запрос к backend_url: при наличии self.crm_post — через прокси amo (док. script.js),
-   * иначе fetch + CORS. В «Сеть» при crm_post часто виден только домен amo, не onrender.
-   * jsonFields без x_api_key — ключ добавляется в form при crm_post и в заголовок при fetch.
+   * Запрос к backend_url: сначала fetch (прямо на Render; CORS у API allow_origins=*).
+   * Если fetch не ушёл (блокировка, CORS в редких случаях) — fallback self.crm_post (прокси amo).
+   * Раньше приоритет был crm_post; у части аккаунтов прокси не доходит до внешнего URL — тогда
+   * работал только curl с вашей машины, а кнопка в карточке — нет.
+   * jsonFields без x_api_key — ключ в заголовке fetch или в form при crm_post.
    */
   function backendAmoProxyPost(self, settings, pathSuffix, jsonFields, onResult) {
     var base = String(settings.backend_url || '').trim().replace(/\/+$/, '');
@@ -120,7 +121,8 @@ define(['jquery'], function ($) {
       });
     }
 
-    if (self && typeof self.crm_post === 'function') {
+    function runCrmPost() {
+      if (!(self && typeof self.crm_post === 'function')) return false;
       var flat = { x_api_key: key };
       for (var fk in jsonFields) {
         if (Object.prototype.hasOwnProperty.call(jsonFields, fk)) flat[fk] = jsonFields[fk];
@@ -136,31 +138,40 @@ define(['jquery'], function ($) {
           onResult({ ok: false, status: 0, body: null, err: 'crm_post' });
         },
       );
+      return true;
+    }
+
+    if (typeof fetch === 'function') {
+      fetch(url, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'X-API-KEY': key,
+        },
+        body: JSON.stringify(jsonFields),
+      })
+        .then(function (res) {
+          return res.text().then(function (text) {
+            var b = null;
+            try {
+              b = text ? JSON.parse(text) : null;
+            } catch (e) {
+              b = { _parse_error: true, raw: text };
+            }
+            finish(res.ok, res.status, b, res.ok ? null : 'http');
+          });
+        })
+        .catch(function () {
+          if (!runCrmPost()) {
+            onResult({ ok: false, status: 0, body: null, err: 'network' });
+          }
+        });
       return;
     }
 
-    fetch(url, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'X-API-KEY': key,
-      },
-      body: JSON.stringify(jsonFields),
-    })
-      .then(function (res) {
-        return res.text().then(function (text) {
-          var b = null;
-          try {
-            b = text ? JSON.parse(text) : null;
-          } catch (e) {
-            b = { _parse_error: true, raw: text };
-          }
-          finish(res.ok, res.status, b, res.ok ? null : 'http');
-        });
-      })
-      .catch(function () {
-        onResult({ ok: false, status: 0, body: null, err: 'network' });
-      });
+    if (!runCrmPost()) {
+      onResult({ ok: false, status: 0, body: null, err: 'no_transport' });
+    }
   }
 
   /** Стабильное сравнение карточки при переключении сделок (id в amo бывает string|number). */
@@ -598,7 +609,12 @@ define(['jquery'], function ($) {
           updated_entity: body && body.updated_entity,
           lead_mirror_fields_updated: body && body.lead_mirror_fields_updated,
           innLen: body && body.inn ? String(body.inn).replace(/\D/g, '').length : 0,
-          transport: self && typeof self.crm_post === 'function' ? 'crm_post' : 'fetch',
+          transport:
+            typeof fetch === 'function'
+              ? 'fetch_first_fallback_crm_post'
+              : self && typeof self.crm_post === 'function'
+                ? 'crm_post'
+                : 'none',
           err: success ? undefined : r.err,
         });
         if (success && body.inn) {
@@ -694,7 +710,12 @@ define(['jquery'], function ($) {
           cfvCount: _cfv && _cfv.length,
           hasName: !!(payload && payload.name),
           dadataKeys: data && typeof data === 'object' ? Object.keys(data).slice(0, 12) : [],
-          transport: self && typeof self.crm_post === 'function' ? 'crm_post' : 'fetch',
+          transport:
+            typeof fetch === 'function'
+              ? 'fetch_first_fallback_crm_post'
+              : self && typeof self.crm_post === 'function'
+                ? 'crm_post'
+                : 'none',
         });
         if (!payload) {
           throw new Error(

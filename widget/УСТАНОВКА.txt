@@ -20,11 +20,9 @@ URL и X-API-KEY в ваших настройках / константах.
 Подсказки при наборе: POST /suggest-party на бэкенде. На карточке СДЕЛКИ виджет при необходимости
 сам вызывает GET /api/v4/companies/{id}, чтобы прочитать ИНН (во встроенной модели его часто нет).
 
-Вкладка «Сеть» в DevTools: к Render/onrender запрос может не показываться отдельной строкой —
-виджет при наличии self.crm_post шлёт POST через прокси amo (как в документации script.js).
-В списке виден домен amocrm, а в теле/URL запроса — ваш backend_url. Если прокси недоступен,
-используется fetch (тогда в «Сети» будет ваш хост). С developer_mode = 1 в логе есть
-transport: crm_post или fetch.
+Вкладка «Сеть» в DevTools: с версии 1.2.5 сначала идёт прямой fetch на ваш backend_url
+(в списке виден onrender и т.п.); если браузер блокирует — запасной вариант crm_post (прокси amo,
+в списке часто только amocrm). С developer_mode = 1 в логе: transport fetch_first_fallback_crm_post.
 
 Дальше — те же пункты про backend_url, x_api_key и ID полей (см. ниже).
 
