@@ -65,3 +65,21 @@
   color: #666;
   font-size: 12px;
 }
+.inn-dadata-widget__dev-hint {
+  margin: 10px 0 4px 0;
+  font-size: 11px;
+  color: #994400;
+}
+.inn-dadata-widget__dev {
+  margin: 0;
+  padding: 8px;
+  max-height: 180px;
+  overflow: auto;
+  font-size: 10px;
+  line-height: 1.35;
+  white-space: pre-wrap;
+  word-break: break-word;
+  background: #f8f4f0;
+  border: 1px dashed #c9a;
+  border-radius: 4px;
+}

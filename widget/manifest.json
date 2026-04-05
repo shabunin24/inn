@@ -3,7 +3,7 @@
     "name": "widget.name",
     "description": "widget.description",
     "short_description": "widget.short_description",
-    "version": "1.1.4",
+    "version": "1.2.4",
     "interface_version": 2,
     "init_once": true,
     "locale": ["ru"],
@@ -98,6 +98,11 @@
     },
     {
       "name": "field_opf",
+      "type": "text",
+      "required": false
+    },
+    {
+      "name": "developer_mode",
       "type": "text",
       "required": false
     }

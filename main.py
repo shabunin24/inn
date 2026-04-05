@@ -3,9 +3,9 @@ SaaS backend: ИНН → реквизиты компании (DaData).
 
 Публичное API: POST /company-by-inn, POST /suggest-party (заголовок X-API-KEY).
 
-Вариант C (без виджета amo): POST /integrations/amo/webhook — JSON с lead_id или типовой
-формат вебхука amo (leads.add и т.д.); нужны AMOCRM_API_BASE, AMOCRM_ACCESS_TOKEN, DADATA_API_KEY,
-поля amo (AMO_FIELD_*): при записи ИНН берётся со сделки — PATCH сделки; если ИНН только у связанной компании — PATCH компании (те же id полей или AMO_FIELD_*_COMPANY).
+POST /integrations/amo/webhook — робот amo (JSON с lead_id или типовой leads.status и т.д.) или
+вызов из виджета с X-API-KEY. Форматы сущностей и полей — как в API v4 и в официальном клиенте:
+https://github.com/amocrm/amocrm-api-php
 
 Деплой на Render:
   - Environment (см. блок «Внешние API» ниже в коде)
@@ -19,6 +19,7 @@ import json
 import logging
 import os
 import re
+from pathlib import Path
 from urllib.parse import parse_qs
 from datetime import datetime, timezone
 from contextlib import asynccontextmanager
@@ -30,7 +31,7 @@ from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, ValidationError, field_validator
 
 # ---------------------------------------------------------------------------
 # Внешние API — куда подключаться (ключи и URL: .env или переменные на Render)
@@ -53,10 +54,10 @@ DADATA_API_KEY_HERE = ""
 #    AMOCRM_CLIENT_ID     — Client ID интеграции (если amo выдал; для OAuth с бэкенда)
 #    AMOCRM_CLIENT_SECRET — Secret интеграции (только сюда или в env, не в JS виджета)
 #
-# 2) В коде виджета (архив .zip, script.js / manifest — в кабинете amo, НЕ в этом репозитории):
+# 2) В клиентской части (ваш собранный пакет виджета / общий фронт интеграции — НЕ в этом репозитории):
 #    — URL вашего API: https://inn-efz1.onrender.com/company-by-inn
 #    — Заголовок X-API-KEY: значение из словаря API_KEYS ниже (например test_key_1) —
-#      это ВАШ ключ к бэкенду, его amo не выдаёт; придумываете вы и прописываете в виджете.
+#      это ВАШ ключ к бэкенду; задаёте вы и подставляете туда, откуда грузится виджет.
 #
 # 3) Секрет интеграции amo не вставляйте в публичный JS виджета — только env на Render или
 #    серверную часть; иначе любой сможет прочитать ключ в исходниках виджета.
@@ -317,13 +318,18 @@ async def _resolve_inn_for_webhook(
     amo: httpx.AsyncClient,
     lead: dict[str, Any],
     lead_inn_fid: int,
+    *,
+    company_field_id: int | None = None,
 ) -> _InnWebhookResolution:
     """
     ИНН для DaData: сначала связанная компания (в карточке сделки ИНН обычно там;
     иначе после смены ИНН у компании вебхук брал бы старое значение со сделки или из скана полей).
     Потом — сделка.
+
+    company_field_id — явный field_id ИНН у компании (из виджета field_inn_company или fallback);
+    если None — как в env AMO_FIELD_INN_COMPANY / AMO_FIELD_INN.
     """
-    comp_fid = _amo_company_inn_field_id()
+    comp_fid = company_field_id if company_field_id is not None else _amo_company_inn_field_id()
     if comp_fid is not None:
         for cid in _amo_linked_company_ids(lead):
             comp = await _amo_fetch_company_dict(amo, cid)
@@ -534,6 +540,23 @@ def _party_cache_key(inn: str) -> str:
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+_AGENT_DEBUG_LOG = Path(__file__).resolve().parent / ".cursor" / "debug-b4b4e3.log"
+
+
+def _agent_debug_ndjson(payload: dict[str, Any]) -> None:
+    """Сессия отладки Cursor: NDJSON в репозитории (локальный uvicorn / доступный диск)."""
+    rec = {
+        "sessionId": "b4b4e3",
+        "timestamp": int(datetime.now(timezone.utc).timestamp() * 1000),
+        **payload,
+    }
+    try:
+        _AGENT_DEBUG_LOG.parent.mkdir(parents=True, exist_ok=True)
+        with _AGENT_DEBUG_LOG.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    except OSError:
+        pass
+
 
 def _webhook_patch_include_empty_fields() -> bool:
     """Очищать в amo поля, для которых в DaData пусто (убирает «хвост» прошлой организации). Выключить: AMO_WEBHOOK_CLEAR_OLD_FIELDS=0"""
@@ -675,19 +698,40 @@ def _lead_id_from_leads_sublist(block: Any) -> int | None:
 
 def extract_lead_id_from_amo_webhook_payload(data: Any) -> int | None:
     """
-    ID сделки: кастомный JSON {"lead_id": N} или типовой вебхук amo
-    (leads.add / update / delete / status — первый элемент).
+    ID сделки: кастомный JSON {"lead_id": N} или вебхук amo / digital pipeline:
+    {"leads":{"status":[{id,...}]}} и др. (см. документацию digital pipeline webhooks).
     """
     if not isinstance(data, dict):
         return None
-    for key in ("lead_id", "id", "leadId"):
+    for key in ("lead_id", "id", "leadId", "element_id", "entity_id"):
         lid = _parse_positive_int_id(data.get(key))
         if lid is not None:
             return lid
+    inner = data.get("data")
+    if isinstance(inner, dict):
+        for key in ("id", "lead_id", "element_id"):
+            lid = _parse_positive_int_id(inner.get(key))
+            if lid is not None:
+                return lid
     leads = data.get("leads")
     if isinstance(leads, dict):
-        for sub in ("add", "update", "delete", "status"):
+        # Типовые ключи REST-вебхуков и digital pipeline (status, mail_in, call_in, …)
+        for sub in (
+            "add",
+            "update",
+            "delete",
+            "status",
+            "mail_in",
+            "call_in",
+            "chat",
+            "site_visit",
+            "period",
+        ):
             lid = _lead_id_from_leads_sublist(leads.get(sub))
+            if lid is not None:
+                return lid
+        for block in leads.values():
+            lid = _lead_id_from_leads_sublist(block if isinstance(block, list) else None)
             if lid is not None:
                 return lid
     return None
@@ -722,19 +766,34 @@ def _parse_amo_webhook_json_body(raw: bytes, content_type: str) -> Any | None:
     if not raw or not raw.strip():
         return {}
     text = raw.decode("utf-8", errors="replace").strip()
+    if text.startswith("\ufeff"):
+        text = text.lstrip("\ufeff")
     if not text:
         return {}
     ct = (content_type or "").lower()
 
     if "application/x-www-form-urlencoded" in ct:
         qs = parse_qs(text, keep_blank_values=True)
-        lid = (qs.get("lead_id") or qs.get("id") or [None])[0]
-        if lid and str(lid).strip().isdigit():
-            return {"lead_id": int(str(lid).strip())}
-        logger.warning("amo webhook: form-urlencoded без числового lead_id")
+        for qk in ("lead_id", "id"):
+            lid = (qs.get(qk) or [None])[0]
+            if lid and str(lid).strip().isdigit():
+                return {"lead_id": int(str(lid).strip())}
+        for qk in ("data", "json", "body", "payload", "leads"):
+            vals = qs.get(qk)
+            if not vals or not (vals[0] or "").strip():
+                continue
+            blob = vals[0].strip()
+            try:
+                parsed = json.loads(blob)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(parsed, dict):
+                return parsed
+        logger.warning("amo webhook: form-urlencoded без lead_id и без JSON в полях data/json/body")
         return None
 
-    if "application/json" not in ct and not text.startswith(("{", "[")):
+    looks_json = text.startswith(("{", "["))
+    if "application/json" not in ct and not looks_json:
         logger.warning("amo webhook: не JSON (Content-Type=%s, первые символы не {/[)", content_type)
         return None
     try:
@@ -943,19 +1002,44 @@ async def _party_company_for_inn(
 
 
 @app.post("/company-by-inn")
-async def company_by_inn(
-    body: InnBody,
-    api_key: Annotated[str, Depends(require_api_key)],
-    request: Request,
-):
-    entry = API_KEYS[api_key]
+async def company_by_inn(request: Request):
+    """JSON + заголовок X-API-KEY или form/json с x_api_key в теле (виджет self.crm_post через прокси amo)."""
+    ct = (request.headers.get("content-type") or "").lower()
+    header_key = (request.headers.get("X-API-KEY") or "").strip()
+    api_key_final = header_key if header_key in API_KEYS else ""
+    inn_raw: Any = None
+
+    if "application/x-www-form-urlencoded" in ct or "multipart/form-data" in ct:
+        form = await request.form()
+        if not api_key_final:
+            api_key_final = str(form.get("x_api_key") or form.get("api_key") or "").strip()
+        inn_raw = form.get("inn")
+    else:
+        raw = await request.body()
+        try:
+            jd = json.loads(raw.decode("utf-8") or "{}")
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            jd = {}
+        if isinstance(jd, dict):
+            if not api_key_final:
+                api_key_final = str(jd.get("x_api_key") or jd.get("api_key") or "").strip()
+            inn_raw = jd.get("inn")
+
+    if api_key_final not in API_KEYS:
+        raise HTTPException(status_code=403, detail="Требуется заголовок X-API-KEY или поле x_api_key в теле")
+
+    try:
+        inn = InnBody.model_validate({"inn": str(inn_raw if inn_raw is not None else "")}).inn
+    except ValidationError as e:
+        raise HTTPException(status_code=400, detail="Некорректное поле inn") from e
+
+    entry = API_KEYS[api_key_final]
     if entry["used"] >= entry["limit"]:
         return limit_exceeded_response()
 
-    inn = body.inn
-
     get_dadata_token()  # проверка, что ключ задан (и 500, если нет)
-    company = await _party_company_for_inn(request, inn)
+    # Без кэша: после смены ИНН и деплоя нужны актуальные данные DaData, не старый in-memory ответ.
+    company = await _party_company_for_inn(request, inn, use_cache=False)
     if company is None:
         return JSONResponse(status_code=404, content={"error": "NOT_FOUND"})
 
@@ -965,16 +1049,41 @@ async def company_by_inn(
 
 @app.post("/suggest-party")
 @app.post("/api/suggest-party")
-async def suggest_party(
-    body: SuggestPartyBody,
-    api_key: Annotated[str, Depends(require_api_key)],
-    request: Request,
-):
+async def suggest_party(request: Request):
     """
     Подсказки при наборе текста (виджет). Не тратит лимит API_KEYS — только проверка ключа;
     вызовы DaData suggest учитывайте в квоте DaData.
+    Тело: JSON {query} или form; ключ в заголовке или x_api_key в теле (crm_post).
     """
-    _ = api_key  # ключ уже проверен в Depends
+    ct = (request.headers.get("content-type") or "").lower()
+    header_key = (request.headers.get("X-API-KEY") or "").strip()
+    api_key_final = header_key if header_key in API_KEYS else ""
+    query_raw: Any = None
+
+    if "application/x-www-form-urlencoded" in ct or "multipart/form-data" in ct:
+        form = await request.form()
+        if not api_key_final:
+            api_key_final = str(form.get("x_api_key") or form.get("api_key") or "").strip()
+        query_raw = form.get("query")
+    else:
+        raw = await request.body()
+        try:
+            jd = json.loads(raw.decode("utf-8") or "{}")
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            jd = {}
+        if isinstance(jd, dict):
+            if not api_key_final:
+                api_key_final = str(jd.get("x_api_key") or jd.get("api_key") or "").strip()
+            query_raw = jd.get("query")
+
+    if api_key_final not in API_KEYS:
+        raise HTTPException(status_code=403, detail="Требуется заголовок X-API-KEY или поле x_api_key в теле")
+
+    try:
+        body = SuggestPartyBody.model_validate({"query": str(query_raw or "")})
+    except ValidationError as e:
+        raise HTTPException(status_code=400, detail="Некорректный query") from e
+
     dadata: DadataAsync | None = request.app.state.dadata
     if dadata is None:
         raise HTTPException(status_code=503, detail="DaData не настроена")
@@ -1017,6 +1126,37 @@ def _check_amo_webhook_secret(
         raise HTTPException(status_code=403, detail="Неверный секрет вебхука")
 
 
+def _check_amo_webhook_auth(
+    body_secret: str | None,
+    header_secret: str | None,
+    x_api_key: str | None,
+    body_api_key: str | None = None,
+) -> None:
+    """Робот amo — secret; виджет — X-API-KEY в заголовке или x_api_key в JSON/form (crm_post через прокси)."""
+    for cand in ((x_api_key or "").strip(), (body_api_key or "").strip()):
+        if cand and cand in API_KEYS:
+            return
+    _check_amo_webhook_secret(body_secret, header_secret)
+
+
+async def _load_webhook_payload_dict(request: Request) -> tuple[dict[str, Any] | None, int]:
+    """JSON как у робота/curl; form-urlencoded — как у self.crm_post виджета (прокси amo)."""
+    ct = (request.headers.get("content-type") or "").lower()
+    if "application/x-www-form-urlencoded" in ct or "multipart/form-data" in ct:
+        form = await request.form()
+        data: dict[str, Any] = {}
+        for fk, fv in form.multi_items():
+            if hasattr(fv, "read"):
+                continue
+            data[str(fk)] = fv
+        return (data if data else None), 0
+    raw = await request.body()
+    parsed = _parse_amo_webhook_json_body(raw, request.headers.get("content-type", ""))
+    if isinstance(parsed, dict):
+        return parsed, len(raw)
+    return None, len(raw)
+
+
 @app.get("/integrations/amo/webhook")
 async def amo_webhook_get_info():
     """
@@ -1029,9 +1169,11 @@ async def amo_webhook_get_info():
         "content_type": "application/json",
         "example_body": {"lead_id": 12345},
         "amo_setup": [
-            "amo → Сделки → воронка → Digital pipeline / Роботы → действие «Отправить вебхук».",
-            "URL: https://ВАШ.onrender.com/integrations/amo/webhook , POST, JSON с id сделки, напр. {\"lead_id\": \"{{lead.id}}\"} (макрос из подсказок amo).",
-            "Без робота сервер не вызывается — в карточке «ничего не происходит».",
+            "amo → Сделки → настройки digital pipeline → этап → «API: отправить webhook».",
+            "URL: https://ВАШ.onrender.com/integrations/amo/webhook — amo сам шлёт JSON вида {\"leads\":{\"status\":[{\"id\":...}]}}; парсер это понимает.",
+            "Кастомное тело: {\"lead_id\": \"{{lead.id}}\"} если в интерфейсе есть подстановка.",
+            "Если робот не настроен: виджет после «Заполнить» дополнительно дергает этот URL с X-API-KEY.",
+            "Без робота и без виджета сервер из amo сам не вызывается — только curl для проверки.",
         ],
         "self_test": (
             'curl -sS -X POST "https://ВАШ.onrender.com/integrations/amo/webhook" '
@@ -1045,19 +1187,23 @@ async def amo_webhook_get_info():
 async def amo_sync_lead_webhook(
     request: Request,
     x_webhook_secret: Annotated[str | None, Header(alias="X-Webhook-Secret")] = None,
+    x_api_key: Annotated[str | None, Header(alias="X-API-KEY")] = None,
 ):
     """
-    Вариант C: без виджета. URL для автоматизации amo «Отправить вебхук».
+    Синхронизация сделки по ИНН (DaData → PATCH amo).
 
-    Тело JSON (любой подходящий вариант):
-      - {"lead_id": <id>} или {"id": <id>} — кастомный шаблон;
-      - типовой вебхук amo с вложением leads.add[0].id / update / status и т.д.
+    Источники вызова:
+      - Робот amo «API: отправить webhook» / кастомный JSON с lead_id;
+      - Виджет после заполнения полей — POST с заголовком X-API-KEY (как у /company-by-inn).
 
-    Если задан AMO_WEBHOOK_SECRET — передайте тот же текст в JSON \"secret\" или в заголовке X-Webhook-Secret.
+    Тело JSON:
+      - {\"lead_id\": <id>} или {\"id\": <id>};
+      - опционально field_inn, field_inn_company — id полей ИНН (как в настройках виджета), иначе только env AMO_FIELD_*;
+      - вебхук amo: {\"leads\": {\"status\": [{\"id\": ...}]}} и аналоги (mail_in, update, …).
+
+    Если задан AMO_WEBHOOK_SECRET — для вызовов без X-API-KEY: \"secret\" в JSON или X-Webhook-Secret.
     """
-    raw = await request.body()
-    ct = request.headers.get("content-type", "")
-    data = _parse_amo_webhook_json_body(raw, ct)
+    data, raw_len = await _load_webhook_payload_dict(request)
     if data is None:
         logger.info("amo webhook result: INVALID_JSON")
         return JSONResponse(
@@ -1066,7 +1212,7 @@ async def amo_sync_lead_webhook(
                 "ok": False,
                 "reason": "INVALID_JSON",
                 "hint": (
-                    "Тело должно быть валидным JSON. Подставьте числовой id сделки, без слов-заглушек: "
+                    "Тело должно быть валидным JSON или form с lead_id. Подставьте числовой id сделки: "
                     '{"lead_id": 12345678}'
                 ),
             },
@@ -1077,12 +1223,17 @@ async def amo_sync_lead_webhook(
 
     logger.info(
         "amo webhook: bytes=%s lead_id=%s top_keys=%s",
-        len(raw),
+        raw_len,
         lead_id,
         list(data.keys()) if isinstance(data, dict) else type(data).__name__,
     )
 
-    _check_amo_webhook_secret(body_secret, x_webhook_secret)
+    body_api_key = None
+    if isinstance(data, dict):
+        bk = data.get("x_api_key") or data.get("api_key")
+        if isinstance(bk, str) and bk.strip():
+            body_api_key = bk.strip()
+    _check_amo_webhook_auth(body_secret, x_webhook_secret, x_api_key, body_api_key)
 
     if lead_id is None:
         logger.info("amo webhook result: NO_LEAD_ID")
@@ -1102,9 +1253,16 @@ async def amo_sync_lead_webhook(
             detail="amoCRM не настроен: задайте AMOCRM_API_BASE и AMOCRM_ACCESS_TOKEN",
         )
 
-    inn_fid = _amo_lead_field_id("AMO_FIELD_INN")
+    field_inn_body = _parse_positive_int_id(data.get("field_inn")) if isinstance(data, dict) else None
+    field_inn_company_body = _parse_positive_int_id(data.get("field_inn_company")) if isinstance(data, dict) else None
+    inn_fid = field_inn_body or _amo_lead_field_id("AMO_FIELD_INN")
     if inn_fid is None:
-        raise HTTPException(status_code=500, detail="Не задано поле ИНН (AMO_FIELD_INN)")
+        raise HTTPException(
+            status_code=500,
+            detail="Не задано поле ИНН: укажите AMO_FIELD_INN на сервере или передайте field_inn в JSON (как в виджете).",
+        )
+    # Как в виджете: компания — field_inn_company или тот же id, что и на сделке; иначе env.
+    company_read_fid = field_inn_company_body or field_inn_body or _amo_company_inn_field_id()
 
     get_dadata_token()
 
@@ -1134,7 +1292,12 @@ async def amo_sync_lead_webhook(
 
     lead = await _amo_enrich_lead_with_companies_if_needed(amo, lead, lead_id)
 
-    resolved = await _resolve_inn_for_webhook(amo, lead, inn_fid)
+    resolved = await _resolve_inn_for_webhook(
+        amo,
+        lead,
+        inn_fid,
+        company_field_id=company_read_fid,
+    )
     inn = resolved.inn
     write_entity = resolved.write_entity
     write_company_id = resolved.company_id
@@ -1147,6 +1310,14 @@ async def amo_sync_lead_webhook(
     )
     if len(inn) not in (10, 12):
         logger.info("amo webhook result: BAD_INN lead_id=%s inn_digits=%r", lead_id, inn)
+        _agent_debug_ndjson(
+            {
+                "location": "main.py:amo_sync_lead_webhook",
+                "message": "BAD_INN",
+                "hypothesisId": "H1",
+                "data": {"lead_id": lead_id, "inn_len": len(inn), "write_entity_guess": write_entity},
+            }
+        )
         return JSONResponse(
             status_code=200,
             content={
@@ -1164,6 +1335,14 @@ async def amo_sync_lead_webhook(
     company = await _party_company_for_inn(request, inn, use_cache=False)
     if company is None:
         logger.info("amo webhook result: NOT_FOUND lead_id=%s inn=%s", lead_id, inn)
+        _agent_debug_ndjson(
+            {
+                "location": "main.py:amo_sync_lead_webhook",
+                "message": "NOT_FOUND",
+                "hypothesisId": "H1",
+                "data": {"lead_id": lead_id, "inn": inn},
+            }
+        )
         return JSONResponse(
             status_code=200,
             content={"ok": False, "reason": "NOT_FOUND", "lead_id": lead_id, "inn": inn},
@@ -1178,6 +1357,14 @@ async def amo_sync_lead_webhook(
     legal_name = (company.get("name") or "").strip() if write_entity == "company" else ""
     if not cfv and not (write_entity == "company" and legal_name):
         logger.info("amo webhook result: NO_MAPPED_FIELDS lead_id=%s", lead_id)
+        _agent_debug_ndjson(
+            {
+                "location": "main.py:amo_sync_lead_webhook",
+                "message": "NO_MAPPED_FIELDS",
+                "hypothesisId": "H2",
+                "data": {"lead_id": lead_id, "write_entity": write_entity},
+            }
+        )
         return JSONResponse(
             status_code=200,
             content={"ok": False, "reason": "NO_MAPPED_FIELDS", "lead_id": lead_id},
@@ -1239,19 +1426,68 @@ async def amo_sync_lead_webhook(
         logger.exception("amo недоступен при PATCH: %s", e)
         raise HTTPException(status_code=502, detail="Ошибка сети при обновлении amo") from e
 
+    # ИНН часто хранится у связанной компании → PATCH шёл только в /companies; на карточке сделки
+    # пользователь смотрит доп. поля сделки — дублируем реквизиты на lead теми же AMO_FIELD_* (сделка).
+    lead_mirror_cfv_count = 0
+    if write_entity == "company":
+        lead_cfv = _dadata_row_to_amo_cfv(
+            company,
+            "lead",
+            include_empty=_webhook_patch_include_empty_fields(),
+        )
+        if lead_cfv:
+            try:
+                pr_lead = await amo.patch(
+                    "/api/v4/leads",
+                    json=[{"id": lead_id, "custom_fields_values": lead_cfv}],
+                )
+                pr_lead.raise_for_status()
+                lead_mirror_cfv_count = len(lead_cfv)
+            except httpx.HTTPStatusError as e:
+                raw_l = (e.response.text or "")[:800] if e.response else ""
+                logger.warning(
+                    "amo webhook: зеркалирование на сделку lead_id=%s не удалось: %s body=%s",
+                    lead_id,
+                    e,
+                    raw_l,
+                )
+            except httpx.RequestError as e:
+                logger.warning(
+                    "amo webhook: сеть при зеркалировании на сделку lead_id=%s: %s",
+                    lead_id,
+                    e,
+                )
+
     name_applied = bool(write_entity == "company" and legal_name)
     out: dict[str, Any] = {
         "ok": True,
         "lead_id": lead_id,
         "inn": inn,
-        "fields_updated": len(cfv) + (1 if name_applied else 0),
+        "fields_updated": len(cfv) + (1 if name_applied else 0) + lead_mirror_cfv_count,
         "updated_entity": write_entity,
     }
+    if lead_mirror_cfv_count:
+        out["lead_mirror_fields_updated"] = lead_mirror_cfv_count
     if name_applied:
         out["company_name_applied"] = True
         out["company_name_preview"] = legal_name[:120] + ("…" if len(legal_name) > 120 else "")
     if write_entity == "company" and write_company_id is not None:
         out["company_id"] = write_company_id
+    _agent_debug_ndjson(
+        {
+            "location": "main.py:amo_sync_lead_webhook",
+            "message": "OK",
+            "hypothesisId": "H1",
+            "data": {
+                "lead_id": lead_id,
+                "write_entity": write_entity,
+                "company_id": write_company_id,
+                "cfv_count": len(cfv),
+                "lead_mirror_cfv_count": lead_mirror_cfv_count,
+                "fields_updated": out["fields_updated"],
+            },
+        }
+    )
     logger.info("amo webhook OK %s", out)
     return out
 
