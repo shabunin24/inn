@@ -1041,6 +1041,23 @@ define(['jquery'], function ($) {
       },
 
       bind_actions: function () {
+        try {
+          var st0 = self.get_settings() || {};
+          var host0 = '';
+          try {
+            var bu = String(st0.backend_url || '').trim();
+            if (bu) host0 = new URL(bu).host;
+          } catch (eHost) {
+            host0 = '(некорректный URL)';
+          }
+          devTrace(self, st0, 'виджет подключён: backend host, crm_post', {
+            backendHost: host0 || '(пусто)',
+            hasKey: String(st0.x_api_key || '').trim().length > 0,
+            crm_post: typeof self.crm_post === 'function',
+          });
+        } catch (eBind) {
+          /* ignore */
+        }
         $(document)
           .off('input.innDadataSuggest')
           .on('input.innDadataSuggest', '.js-inn-dadata-input', function () {
