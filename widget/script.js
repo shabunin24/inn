@@ -7,7 +7,7 @@
  * @see https://www.amocrm.ru/developers/content/crm_platform/api-v4
  * @see https://github.com/amocrm/amocrm-api-php
  *
- * Внешний бэкенд: сначала fetch (CORS allow_origins=* на FastAPI), при сбое — self.crm_post (прокси amo).
+ * Внешний бэкенд: по доке amo — self.crm_post (прокси); при сбое — fetch на FastAPI (CORS *).
  */
 define(['jquery'], function ($) {
   'use strict';
@@ -85,11 +85,15 @@ define(['jquery'], function ($) {
   }
 
   /**
-   * Запрос к backend_url: сначала fetch (прямо на Render; CORS у API allow_origins=*).
-   * Если fetch не ушёл (блокировка, CORS в редких случаях) — fallback self.crm_post (прокси amo).
-   * Раньше приоритет был crm_post; у части аккаунтов прокси не доходит до внешнего URL — тогда
-   * работал только curl с вашей машины, а кнопка в карточке — нет.
-   * jsonFields без x_api_key — ключ в заголовке fetch или в form при crm_post.
+   * Вызов вашего API с карточки amo.
+   *
+   * Документация amo (script.js): для кросс-доменных запросов нужен self.crm_post — прокси amoCRM;
+   * «браузер может блокировать кросс-доменные запросы» при работе по SSL.
+   * Поэтому порядок: 1) crm_post 2) при ошибке прокси или битом JSON — fetch (CORS на FastAPI = *).
+   * Если наоборот сначала fetch — в части окружений запрос до Render не уходит (CSP/connect-src),
+   * в «Сети» может не быть onrender, хотя curl с ПК работает.
+   *
+   * @see https://www.amocrm.ru/developers/content/integrations/script_js (crm_post)
    */
   function backendAmoProxyPost(self, settings, pathSuffix, jsonFields, onResult) {
     var base = String(settings.backend_url || '').trim().replace(/\/+$/, '');
@@ -121,27 +125,11 @@ define(['jquery'], function ($) {
       });
     }
 
-    function runCrmPost() {
-      if (!(self && typeof self.crm_post === 'function')) return false;
-      var flat = { x_api_key: key };
-      for (var fk in jsonFields) {
-        if (Object.prototype.hasOwnProperty.call(jsonFields, fk)) flat[fk] = jsonFields[fk];
+    function runFetch() {
+      if (typeof fetch !== 'function') {
+        onResult({ ok: false, status: 0, body: null, err: 'network' });
+        return;
       }
-      self.crm_post(
-        url,
-        flat,
-        function (msg) {
-          finish(true, 200, normalizeParsed(msg), null);
-        },
-        'json',
-        function () {
-          onResult({ ok: false, status: 0, body: null, err: 'crm_post' });
-        },
-      );
-      return true;
-    }
-
-    if (typeof fetch === 'function') {
       fetch(url, {
         method: 'POST',
         headers: {
@@ -149,6 +137,9 @@ define(['jquery'], function ($) {
           'X-API-KEY': key,
         },
         body: JSON.stringify(jsonFields),
+        cache: 'no-store',
+        mode: 'cors',
+        credentials: 'omit',
       })
         .then(function (res) {
           return res.text().then(function (text) {
@@ -162,16 +153,36 @@ define(['jquery'], function ($) {
           });
         })
         .catch(function () {
-          if (!runCrmPost()) {
-            onResult({ ok: false, status: 0, body: null, err: 'network' });
-          }
+          onResult({ ok: false, status: 0, body: null, err: 'network' });
         });
+    }
+
+    var flat = { x_api_key: key };
+    for (var fk in jsonFields) {
+      if (Object.prototype.hasOwnProperty.call(jsonFields, fk)) flat[fk] = jsonFields[fk];
+    }
+
+    if (self && typeof self.crm_post === 'function') {
+      self.crm_post(
+        url,
+        flat,
+        function (msg) {
+          var parsed = normalizeParsed(msg);
+          if (parsed && parsed._parse_error) {
+            runFetch();
+            return;
+          }
+          finish(true, 200, parsed, null);
+        },
+        'json',
+        function () {
+          runFetch();
+        },
+      );
       return;
     }
 
-    if (!runCrmPost()) {
-      onResult({ ok: false, status: 0, body: null, err: 'no_transport' });
-    }
+    runFetch();
   }
 
   /** Стабильное сравнение карточки при переключении сделок (id в amo бывает string|number). */
@@ -558,10 +569,10 @@ define(['jquery'], function ($) {
           hint = Ls('err_suggest_503', 'На сервере не настроен DADATA_API_KEY.');
         } else if (r.status === 502 || r.err === 'parse') {
           hint = Ls('err_suggest_parse', 'Некорректный ответ сервера на /suggest-party.');
-        } else if (r.status === 0 || r.err === 'crm_post' || r.err === 'network') {
+        } else if (r.status === 0 || r.err === 'network') {
           hint = Ls(
             'err_suggest_net',
-            'Сеть: не удалось вызвать подсказки. Проверьте URL бэкенда, прокси amo (crm_post) или CORS.',
+            'Сеть: не удалось вызвать подсказки (crm_post и fetch). Проверьте URL, HTTPS и ключ.',
           );
         } else {
           hint = Ls('err_suggest', 'Подсказки недоступны') + ' (HTTP ' + r.status + ')';
@@ -610,10 +621,10 @@ define(['jquery'], function ($) {
           lead_mirror_fields_updated: body && body.lead_mirror_fields_updated,
           innLen: body && body.inn ? String(body.inn).replace(/\D/g, '').length : 0,
           transport:
-            typeof fetch === 'function'
-              ? 'fetch_first_fallback_crm_post'
-              : self && typeof self.crm_post === 'function'
-                ? 'crm_post'
+            self && typeof self.crm_post === 'function'
+              ? 'crm_post_then_fetch_fallback'
+              : typeof fetch === 'function'
+                ? 'fetch_only'
                 : 'none',
           err: success ? undefined : r.err,
         });
@@ -788,9 +799,7 @@ define(['jquery'], function ($) {
             ? d
             : typeof err === 'string'
               ? err
-              : r.err === 'crm_post'
-                ? 'Ошибка прокси amo (crm_post)'
-                : r.err === 'network'
+              : r.err === 'network'
                   ? 'Сеть: не удалось вызвать бэкенд'
                   : r.err === 'parse'
                     ? 'Некорректный ответ сервера'
@@ -813,10 +822,10 @@ define(['jquery'], function ($) {
           hasName: !!(payload && payload.name),
           dadataKeys: data && typeof data === 'object' ? Object.keys(data).slice(0, 12) : [],
           transport:
-            typeof fetch === 'function'
-              ? 'fetch_first_fallback_crm_post'
-              : self && typeof self.crm_post === 'function'
-                ? 'crm_post'
+            self && typeof self.crm_post === 'function'
+              ? 'crm_post_then_fetch_fallback'
+              : typeof fetch === 'function'
+                ? 'fetch_only'
                 : 'none',
         });
         if (!payload) {
