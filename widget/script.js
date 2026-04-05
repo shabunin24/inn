@@ -629,6 +629,76 @@ define(['jquery'], function ($) {
     });
   }
 
+  /** Сообщение «Заполнено» только если сервер реально записал поля в amo. */
+  function showAutoMsgIfWebhookUpdated(self, body) {
+    var st = self.get_settings() || {};
+    devTrace(self, st, 'авто-синх (ответ сервера)', {
+      ok: !!(body && body.ok),
+      fields_updated: body && body.fields_updated,
+      reason: (body && body.reason) || null,
+      updated_entity: (body && body.updated_entity) || null,
+      lead_mirror_fields_updated: body && body.lead_mirror_fields_updated,
+    });
+    if (!body || !body.ok || !(body.fields_updated > 0)) {
+      if (isDeveloperMode(st)) {
+        var $m = $('.js-inn-dadata-msg');
+        var parts = ['[dev] авто'];
+        if (body) {
+          parts.push('ok=' + body.ok);
+          parts.push('fields_updated=' + (body.fields_updated != null ? body.fields_updated : '—'));
+          if (body.reason) parts.push('reason=' + body.reason);
+          if (body.hint) parts.push('hint=' + String(body.hint).slice(0, 160));
+        } else parts.push('нет JSON в ответе');
+        $m.text(parts.join(' · '));
+      }
+      return;
+    }
+    var $m2 = $('.js-inn-dadata-msg');
+    $m2.text(tr(self, 'auto_ok', 'Заполнено из DaData'));
+    setTimeout(function () {
+      $m2.text('');
+    }, 4000);
+  }
+
+  /**
+   * На сделке сначала вызывается webhook на Render; если из браузера он не сработал или
+   * fields_updated=0 — дублируем сценарий в карточке: company-by-inn + PATCH через amoApiV4
+   * (как при ручном заполнении). Так обходим случаи, когда curl к webhook работает, а запрос из iframe — нет.
+   */
+  function maybeRunClientAfterLeadWebhook(self, st, live, webhookOk, body, fromButton) {
+    var fu = body && Number(body.fields_updated);
+    var serverOk = !!(body && body.ok === true);
+    var needClient = !webhookOk || !serverOk || !(fu > 0);
+    if (!needClient) return;
+    resolveInnForCard(self, live, st, function (resolved) {
+      if (window.__innDadataBusy) return;
+      var inn = resolved.inn;
+      if (inn.length !== 10 && inn.length !== 12) {
+        if (fromButton) {
+          alert(
+            tr(self, 'err_api', 'Ошибка') +
+              ': webhook не обновил сделку, ИНН в карточке не найден — проверьте field_inn / field_inn_company.',
+          );
+        }
+        return;
+      }
+      var skipDup =
+        inn === self._innDadataLastProcessedInn &&
+        webhookOk &&
+        serverOk &&
+        fu > 0;
+      if (skipDup) return;
+      devTrace(self, st, 'клиентский fallback после webhook', {
+        webhookOk: webhookOk,
+        bodyOk: serverOk,
+        fields_updated: body && body.fields_updated,
+        innLen: inn.length,
+        fromButton: !!fromButton,
+      });
+      runPipeline(self, st, live, inn, !!fromButton, resolved.patchMeta);
+    });
+  }
+
   function runPipeline(self, settings, ctx, inn, fromButton, patchMeta) {
     var L = function (k, fb) {
       return tr(self, k, fb);
@@ -844,36 +914,6 @@ define(['jquery'], function ($) {
     self._innDadataModel = ctx.model;
     self._innDadataLastProcessedInn = '';
 
-    function showAutoMsgIfUpdated(body) {
-      var st = self.get_settings() || {};
-      devTrace(self, st, 'авто-синх (ответ сервера)', {
-        ok: !!(body && body.ok),
-        fields_updated: body && body.fields_updated,
-        reason: (body && body.reason) || null,
-        updated_entity: (body && body.updated_entity) || null,
-        lead_mirror_fields_updated: body && body.lead_mirror_fields_updated,
-      });
-      if (!body || !body.ok || !(body.fields_updated > 0)) {
-        if (isDeveloperMode(st)) {
-          var $m = $('.js-inn-dadata-msg');
-          var parts = ['[dev] авто'];
-          if (body) {
-            parts.push('ok=' + body.ok);
-            parts.push('fields_updated=' + (body.fields_updated != null ? body.fields_updated : '—'));
-            if (body.reason) parts.push('reason=' + body.reason);
-            if (body.hint) parts.push('hint=' + String(body.hint).slice(0, 160));
-          } else parts.push('нет JSON в ответе');
-          $m.text(parts.join(' · '));
-        }
-        return;
-      }
-      var $m2 = $('.js-inn-dadata-msg');
-      $m2.text(tr(self, 'auto_ok', 'Заполнено из DaData'));
-      setTimeout(function () {
-        $m2.text('');
-      }, 4000);
-    }
-
     self._innDadataHandler = function () {
       if (window.__innDadataBusy) return;
       var c = currentCardContext(self);
@@ -889,7 +929,8 @@ define(['jquery'], function ($) {
         if (live.kind === 'leads' && hb) {
           devTrace(self, st, 'событие модели → webhook', { leadId: live.id });
           requestServerLeadSync(self, st, live.id, function (ok, body) {
-            if (ok) showAutoMsgIfUpdated(body);
+            if (ok) showAutoMsgIfWebhookUpdated(self, body);
+            maybeRunClientAfterLeadWebhook(self, st, live, ok, body, false);
           });
           return;
         }
@@ -936,7 +977,8 @@ define(['jquery'], function ($) {
       if (!self._innDadataModel) return;
       if (cc.kind === 'leads' && hb) {
         requestServerLeadSync(self, st, cc.id, function (ok, body) {
-          if (ok) showAutoMsgIfUpdated(body);
+          if (ok) showAutoMsgIfWebhookUpdated(self, body);
+          maybeRunClientAfterLeadWebhook(self, st, cc, ok, body, false);
         });
         return;
       }
@@ -1011,15 +1053,11 @@ define(['jquery'], function ($) {
             }
             if (ctx.kind === 'leads') {
               requestServerLeadSync(self, settings, ctx.id, function (ok, body) {
-                if (ok) {
+                if (ok && body && body.ok === true && Number(body.fields_updated) > 0) {
                   alert(L('ok', 'Готово. Обновите страницу (F5), если поля не обновились.'));
                   return;
                 }
-                var hint =
-                  body && (body.hint || body.reason)
-                    ? String(body.hint || body.reason)
-                    : 'Сервер не обновил сделку (проверьте ИНН на сделке/компании и env AMO_FIELD_* на Render).';
-                alert(L('err_api', 'Ошибка') + ': ' + hint);
+                maybeRunClientAfterLeadWebhook(self, settings, ctx, ok, body, true);
               });
               return;
             }
@@ -1125,7 +1163,10 @@ define(['jquery'], function ($) {
               var st1 = self.get_settings() || {};
               var cx1 = currentCardContext(self);
               if (cx1 && cx1.kind === 'leads' && cx1.id) {
-                requestServerLeadSync(self, st1, cx1.id, function () {});
+                requestServerLeadSync(self, st1, cx1.id, function (ok, body) {
+                  if (ok) showAutoMsgIfWebhookUpdated(self, body);
+                  maybeRunClientAfterLeadWebhook(self, st1, cx1, ok, body, false);
+                });
               }
             }, 2000);
           }
