@@ -699,6 +699,38 @@ define(['jquery'], function ($) {
     });
   }
 
+  /**
+   * Сделка при заданном backend_url: webhook на Render читает сделку через REST amo — там только
+   * уже сохранённый ИНН. Если пользователь меняет ИНН в карточке и не нажал «Сохранить», в API
+   * остаётся старое значение → «без изменений». Сначала берём ИНН из модели карточки (resolveInnAndPatch)
+   * и runPipeline; иначе webhook + fallback как раньше.
+   */
+  function handleLeadCardHybridSync(self, live, st) {
+    var hb =
+      String(st.backend_url || '').trim().length > 0 &&
+      String(st.x_api_key || '').trim().length > 0;
+    if (!hb || live.kind !== 'leads') return;
+    var quick = resolveInnAndPatch(live, live.model, st);
+    if ((quick.inn.length === 10 || quick.inn.length === 12) && quick.inn !== self._innDadataLastProcessedInn) {
+      devTrace(self, st, 'сделка: ИНН из модели карточки → runPipeline', {
+        innLen: quick.inn.length,
+        hasPatchMeta: !!(quick.patchMeta && quick.patchMeta.kind),
+      });
+      runPipeline(self, st, live, quick.inn, false, quick.patchMeta);
+      return;
+    }
+    if (quick.inn.length !== 10 && quick.inn.length !== 12) {
+      self._innDadataLastProcessedInn = '';
+    } else if (quick.inn === self._innDadataLastProcessedInn) {
+      return;
+    }
+    devTrace(self, st, 'событие модели → webhook', { leadId: live.id });
+    requestServerLeadSync(self, st, live.id, function (ok, body) {
+      if (ok) showAutoMsgIfWebhookUpdated(self, body);
+      maybeRunClientAfterLeadWebhook(self, st, live, ok, body, false);
+    });
+  }
+
   function runPipeline(self, settings, ctx, inn, fromButton, patchMeta) {
     var L = function (k, fb) {
       return tr(self, k, fb);
@@ -927,11 +959,7 @@ define(['jquery'], function ($) {
           String(st.backend_url || '').trim().length > 0 &&
           String(st.x_api_key || '').trim().length > 0;
         if (live.kind === 'leads' && hb) {
-          devTrace(self, st, 'событие модели → webhook', { leadId: live.id });
-          requestServerLeadSync(self, st, live.id, function (ok, body) {
-            if (ok) showAutoMsgIfWebhookUpdated(self, body);
-            maybeRunClientAfterLeadWebhook(self, st, live, ok, body, false);
-          });
+          handleLeadCardHybridSync(self, live, st);
           return;
         }
         var fid = parseInt(String(st.field_inn || '').trim(), 10);
@@ -976,10 +1004,7 @@ define(['jquery'], function ($) {
       }
       if (!self._innDadataModel) return;
       if (cc.kind === 'leads' && hb) {
-        requestServerLeadSync(self, st, cc.id, function (ok, body) {
-          if (ok) showAutoMsgIfWebhookUpdated(self, body);
-          maybeRunClientAfterLeadWebhook(self, st, cc, ok, body, false);
-        });
+        handleLeadCardHybridSync(self, cc, st);
         return;
       }
       if (cc.kind !== 'leads') return;
@@ -1163,10 +1188,7 @@ define(['jquery'], function ($) {
               var st1 = self.get_settings() || {};
               var cx1 = currentCardContext(self);
               if (cx1 && cx1.kind === 'leads' && cx1.id) {
-                requestServerLeadSync(self, st1, cx1.id, function (ok, body) {
-                  if (ok) showAutoMsgIfWebhookUpdated(self, body);
-                  maybeRunClientAfterLeadWebhook(self, st1, cx1, ok, body, false);
-                });
+                handleLeadCardHybridSync(self, cx1, st1);
               }
             }, 2000);
           }
