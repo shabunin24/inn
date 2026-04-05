@@ -13,6 +13,13 @@ define(['jquery'], function ($) {
   'use strict';
 
   /**
+   * Поиск в DevTools (Sources / по всем файлам): INNDADATA_WIDGET_F12_MARKER — этот файл виджета.
+   * Строку «render» не используйте: в коде amo есть onRender*, это не Render.com и не ваш бэкенд.
+   * URL бэкенда в исходнике нет — его подставляет amo из настроек (backend_url) в рантайме.
+   */
+  var WIDGET_F12_SEARCH = 'INNDADATA_WIDGET_F12_MARKER';
+
+  /**
    * Авторизованные запросы к /api/v4/* внутри аккаунта (типичный метод виджета в amo).
    */
   function hasAmoAuthorizedAjax(self) {
@@ -1051,6 +1058,7 @@ define(['jquery'], function ($) {
             host0 = '(некорректный URL)';
           }
           devTrace(self, st0, 'виджет подключён: backend host, crm_post', {
+            devtoolsSearch: WIDGET_F12_SEARCH,
             backendHost: host0 || '(пусто)',
             hasKey: String(st0.x_api_key || '').trim().length > 0,
             crm_post: typeof self.crm_post === 'function',
