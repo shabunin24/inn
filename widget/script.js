@@ -731,6 +731,11 @@ define(['jquery'], function ($) {
       return;
     }
     if (quick.inn.length !== 10 && quick.inn.length !== 12) {
+      if (quick.inn.length > 0) {
+        devTrace(self, st, 'ИНН из поля: длина не 10 и не 12 — runPipeline не вызываем, дальше webhook', {
+          innLen: quick.inn.length,
+        });
+      }
       self._innDadataLastProcessedInn = '';
     } else if (quick.inn === self._innDadataLastProcessedInn) {
       return;
