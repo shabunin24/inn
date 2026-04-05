@@ -938,6 +938,25 @@ define(['jquery'], function ($) {
     var ctx = currentCardContext(self);
     if (!ctx || !ctx.model) {
       self._innAttachAttempt = (self._innAttachAttempt || 0) + 1;
+      if (self._innAttachAttempt === 24 && isDeveloperMode(settings)) {
+        try {
+          if (
+            typeof APP !== 'undefined' &&
+            APP.data &&
+            APP.data.current_card &&
+            (APP.data.current_card.id === 0 || APP.data.current_card.id === '0')
+          ) {
+            devTrace(
+              self,
+              settings,
+              'id сделки = 0 (черновик) — сохраните карточку; пока виджет не шлёт запросы на бэкенд',
+              {},
+            );
+          }
+        } catch (eId0) {
+          /* ignore */
+        }
+      }
       if (self._innAttachAttempt > 80) return;
       if (self._innAttachRetryTimer) clearTimeout(self._innAttachRetryTimer);
       self._innAttachRetryTimer = setTimeout(function () {

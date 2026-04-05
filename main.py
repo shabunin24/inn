@@ -107,7 +107,8 @@ AMOCRM_CLIENT_SECRET = os.environ.get("AMOCRM_CLIENT_SECRET", "").strip()
 # Вебхук (вариант C): если задан — проверяем телом secret= или заголовок X-Webhook-Secret
 AMO_WEBHOOK_SECRET = os.environ.get("AMO_WEBHOOK_SECRET", "").strip()
 
-# ID полей сделки в amo → env можно переопределить; иначе значения из вашей вёрстки
+# ID полей сделки в amo → env AMO_FIELD_* (для PATCH /leads и зеркала на сделку).
+# Для компании отдельно: AMO_FIELD_*_COMPANY — без них для /companies берётся тот же id, что и для сделки.
 _DEFAULT_AMO_LEAD_FIELDS: dict[str, str] = {
     "AMO_FIELD_INN": "1303797",
     "AMO_FIELD_KPP": "1303799",
@@ -563,6 +564,14 @@ def _webhook_patch_include_empty_fields() -> bool:
     return os.environ.get("AMO_WEBHOOK_CLEAR_OLD_FIELDS", "1").strip().lower() not in ("0", "false", "no")
 
 
+def _webhook_lead_mirror_enabled() -> bool:
+    """
+    После PATCH компании дублировать реквизиты на сделку (те же AMO_FIELD_* для сущности lead).
+    Выключить: AMO_WEBHOOK_LEAD_MIRROR=0 — если на сделке нет своих полей или не заданы id полей сделки.
+    """
+    return os.environ.get("AMO_WEBHOOK_LEAD_MIRROR", "1").strip().lower() not in ("0", "false", "no")
+
+
 def _resolve_dadata_api_key() -> str:
     """Сначала env DADATA_API_KEY, иначе строка DADATA_API_KEY_HERE в этом файле."""
     return (os.environ.get("DADATA_API_KEY", "").strip() or DADATA_API_KEY_HERE.strip())
@@ -622,6 +631,19 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+def _log_http_requests_enabled() -> bool:
+    """В Render по умолчанию видно каждый входящий запрос; отключить: LOG_HTTP_REQUESTS=0"""
+    return os.environ.get("LOG_HTTP_REQUESTS", "1").strip().lower() not in ("0", "false", "no")
+
+
+@app.middleware("http")
+async def log_incoming_http(request: Request, call_next):
+    if _log_http_requests_enabled():
+        host = request.client.host if request.client else "?"
+        logger.info("http_in %s %s client=%s", request.method, request.url.path, host)
+    return await call_next(request)
 
 
 @app.exception_handler(RequestValidationError)
@@ -688,18 +710,28 @@ def _parse_positive_int_id(v: Any) -> int | None:
 
 
 def _lead_id_from_leads_sublist(block: Any) -> int | None:
-    if not isinstance(block, list) or not block:
+    """
+    Элемент внутри leads.*: массив [{id: ...}] (digital pipeline / робот) или
+    объект {\"0\": {id: ...}} как в официальном формате вебхуков amoМаркет.
+    """
+    if isinstance(block, list) and block:
+        first = block[0]
+        if isinstance(first, dict):
+            return _parse_positive_int_id(first.get("id"))
         return None
-    first = block[0]
-    if isinstance(first, dict):
-        return _parse_positive_int_id(first.get("id"))
+    if isinstance(block, dict) and block:
+        for item in block.values():
+            if isinstance(item, dict):
+                lid = _parse_positive_int_id(item.get("id"))
+                if lid is not None:
+                    return lid
     return None
 
 
 def extract_lead_id_from_amo_webhook_payload(data: Any) -> int | None:
     """
     ID сделки: кастомный JSON {"lead_id": N} или вебхук amo / digital pipeline:
-    {"leads":{"status":[{id,...}]}} и др. (см. документацию digital pipeline webhooks).
+    {"leads":{"status":[{id,...}]}} или формат amoМаркет {"leads":{"status":{"0":{"id":...}}}}.
     """
     if not isinstance(data, dict):
         return None
@@ -731,7 +763,7 @@ def extract_lead_id_from_amo_webhook_payload(data: Any) -> int | None:
             if lid is not None:
                 return lid
         for block in leads.values():
-            lid = _lead_id_from_leads_sublist(block if isinstance(block, list) else None)
+            lid = _lead_id_from_leads_sublist(block)
             if lid is not None:
                 return lid
     return None
@@ -844,7 +876,28 @@ async def root():
             "/suggest-party",
             "/api/suggest-party",
             "/integrations/amo/webhook",
+            "/integrations/amo/ping",
         ],
+    }
+
+
+@app.get("/ping")
+async def ping_get():
+    """Публичная проверка «доходит ли запрос до Render» (без ключа и ИНН)."""
+    return {"ok": True, "where": "render", "method": "GET"}
+
+
+@app.api_route("/integrations/amo/ping", methods=["GET", "POST"])
+async def amo_ping(request: Request):
+    """
+    Проверка «amo → Render»: и GET, и POST (часть интерфейсов amo проверяет URL запросом GET;
+    при ответе 405 только на POST сохранение вебхука может не работать).
+    """
+    return {
+        "ok": True,
+        "where": "render",
+        "method": request.method,
+        "hint": "Ответ 200 и строка http_in в логах Render — запрос до сервера дошёл.",
     }
 
 
@@ -1427,15 +1480,17 @@ async def amo_sync_lead_webhook(
         raise HTTPException(status_code=502, detail="Ошибка сети при обновлении amo") from e
 
     # ИНН часто хранится у связанной компании → PATCH шёл только в /companies; на карточке сделки
-    # пользователь смотрит доп. поля сделки — дублируем реквизиты на lead теми же AMO_FIELD_* (сделка).
+    # пользователь смотрит доп. поля сделки — дублируем реквизиты на lead теми же AMO_FIELD_* (id полей СДЕЛКИ).
+    # AMO_FIELD_*_COMPANY сюда не подставляются: для зеркала нужны отдельные id полей сделки или отключите AMO_WEBHOOK_LEAD_MIRROR=0.
     lead_mirror_cfv_count = 0
-    if write_entity == "company":
+    if write_entity == "company" and _webhook_lead_mirror_enabled():
         lead_cfv = _dadata_row_to_amo_cfv(
             company,
             "lead",
             include_empty=_webhook_patch_include_empty_fields(),
         )
         if lead_cfv:
+            mirror_ids = [row.get("field_id") for row in lead_cfv if isinstance(row, dict)]
             try:
                 pr_lead = await amo.patch(
                     "/api/v4/leads",
@@ -1446,9 +1501,10 @@ async def amo_sync_lead_webhook(
             except httpx.HTTPStatusError as e:
                 raw_l = (e.response.text or "")[:800] if e.response else ""
                 logger.warning(
-                    "amo webhook: зеркалирование на сделку lead_id=%s не удалось: %s body=%s",
+                    "amo webhook: зеркалирование на сделку lead_id=%s не удалось: %s field_ids=%s body=%s",
                     lead_id,
                     e,
+                    mirror_ids,
                     raw_l,
                 )
             except httpx.RequestError as e:
