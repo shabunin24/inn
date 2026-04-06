@@ -193,11 +193,10 @@ define(['jquery'], function ($) {
   }
 
   /**
-   * Подсказки /suggest-party: сначала прямой fetch на Render (CORS * на бэкенде).
-   * У части аккаунтов crm_post не доводит запрос до внешнего URL — подсказки «молчат».
-   * При сетевой ошибке / блокировке fetch — запасной путь как у остального API (crm_post → fetch).
+   * JSON POST на бэкенд: сначала прямой fetch (CORS *), при сетевой ошибке — crm_post → fetch.
+   * Для /suggest-party, /company-by-inn, /integrations/amo/webhook из виджета.
    */
-  function backendAmoSuggestPost(self, settings, pathSuffix, jsonFields, onResult) {
+  function backendAmoJsonPostFetchFirst(self, settings, pathSuffix, jsonFields, onResult) {
     var base = String(settings.backend_url || '').trim().replace(/\/+$/, '');
     var key = String(settings.x_api_key || '').trim();
     var url = base + pathSuffix;
@@ -668,7 +667,7 @@ define(['jquery'], function ($) {
     var Ls = function (k, fb) {
       return tr(self, k, fb);
     };
-    backendAmoSuggestPost(self, settings, '/suggest-party', { query: q }, function (r) {
+    backendAmoJsonPostFetchFirst(self, settings, '/suggest-party', { query: q }, function (r) {
       if (mySeq !== suggestState.seq) return;
       if (!r.ok) {
         hideSuggestDropdown();
@@ -804,7 +803,7 @@ define(['jquery'], function ($) {
     if (!isNaN(_fi) && _fi > 0) whBody.field_inn = _fi;
     var _fic = parseInt(String(settings.field_inn_company || '').trim(), 10);
     if (!isNaN(_fic) && _fic > 0) whBody.field_inn_company = _fic;
-    backendAmoProxyPost(self, settings, '/integrations/amo/webhook', whBody, function (r) {
+    backendAmoJsonPostFetchFirst(self, settings, '/integrations/amo/webhook', whBody, function (r) {
       try {
         var body = r.body;
         var success = !!(r.ok && body && body.ok === true);
@@ -818,12 +817,7 @@ define(['jquery'], function ($) {
           updated_entity: body && body.updated_entity,
           lead_mirror_fields_updated: body && body.lead_mirror_fields_updated,
           innLen: body && body.inn ? String(body.inn).replace(/\D/g, '').length : 0,
-          transport:
-            self && typeof self.crm_post === 'function'
-              ? 'crm_post_then_fetch_fallback'
-              : typeof fetch === 'function'
-                ? 'fetch_only'
-                : 'none',
+          transport: 'json_fetch_first_then_crm_post',
           err: success ? undefined : r.err,
         });
         if (success && body.inn) {
@@ -909,10 +903,8 @@ define(['jquery'], function ($) {
   }
 
   /**
-   * Сделка при заданном backend_url: webhook на Render читает сделку через REST amo — там только
-   * уже сохранённый ИНН. Если пользователь меняет ИНН в карточке и не нажал «Сохранить», в API
-   * остаётся старое значение → «без изменений». Сначала берём ИНН из модели карточки (resolveInnAndPatch)
-   * и runPipeline; иначе webhook + fallback как раньше.
+   * Сделка: при полном ИНН — как робот: POST /integrations/amo/webhook (сервер читает сделку в amo).
+   * Если webhook не заполнил (ИНН ещё не в API, BAD_INN и т.д.) — runPipeline по модели карточки.
    */
   function handleLeadCardHybridSync(self, live, st) {
     var hb =
@@ -922,11 +914,14 @@ define(['jquery'], function ($) {
     var quick = resolveInnAndPatch(live, live.model, st);
     function continueHybrid(q) {
       if ((q.inn.length === 10 || q.inn.length === 12) && q.inn !== self._innDadataLastProcessedInn) {
-        devTrace(self, st, 'сделка: ИНН → runPipeline', {
+        devTrace(self, st, 'сделка: ИНН → webhook (как робот), при сбое — runPipeline', {
           innLen: q.inn.length,
           hasPatchMeta: !!(q.patchMeta && q.patchMeta.kind),
         });
-        runPipeline(self, st, live, q.inn, false, q.patchMeta);
+        requestServerLeadSync(self, st, live.id, function (ok, body) {
+          if (ok) showAutoMsgIfWebhookUpdated(self, body);
+          maybeRunClientAfterLeadWebhook(self, st, live, ok, body, false);
+        });
         return;
       }
       if (q.inn.length !== 10 && q.inn.length !== 12) {
@@ -997,7 +992,7 @@ define(['jquery'], function ($) {
     $msg.text('…');
 
     window.__innDadataBusy = true;
-    backendAmoProxyPost(self, settings, '/company-by-inn', { inn: inn }, function (r) {
+    backendAmoJsonPostFetchFirst(self, settings, '/company-by-inn', { inn: inn }, function (r) {
       function finishBusy() {
         window.__innDadataBusy = false;
       }
