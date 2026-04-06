@@ -709,6 +709,23 @@ def _parse_positive_int_id(v: Any) -> int | None:
     return None
 
 
+_FLAT_LEAD_ID_KEY = re.compile(r"^leads\[(?P<sub>[^\]]+)\]\[(?P<idx>[^\]]+)\]\[id\]$")
+
+
+def _lead_id_from_flat_form_brackets(data: dict[str, Any]) -> int | None:
+    """
+    amoМаркет / вебхук в form-urlencoded отдаёт не вложенный JSON, а плоские ключи:
+    leads[add][0][id], leads[status][0][id], …
+    """
+    for k, v in data.items():
+        if not isinstance(k, str) or not _FLAT_LEAD_ID_KEY.match(k):
+            continue
+        lid = _parse_positive_int_id(v)
+        if lid is not None:
+            return lid
+    return None
+
+
 def _lead_id_from_leads_sublist(block: Any) -> int | None:
     """
     Элемент внутри leads.*: массив [{id: ...}] (digital pipeline / робот) или
@@ -766,6 +783,9 @@ def extract_lead_id_from_amo_webhook_payload(data: Any) -> int | None:
             lid = _lead_id_from_leads_sublist(block)
             if lid is not None:
                 return lid
+    lid_flat = _lead_id_from_flat_form_brackets(data)
+    if lid_flat is not None:
+        return lid_flat
     return None
 
 
