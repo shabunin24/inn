@@ -3,7 +3,7 @@
     "name": "widget.name",
     "description": "widget.description",
     "short_description": "widget.short_description",
-    "version": "1.2.11",
+    "version": "1.2.12",
     "interface_version": 2,
     "init_once": true,
     "locale": ["ru"],
@@ -24,7 +24,7 @@
     {
       "name": "field_inn",
       "type": "text",
-      "required": true
+      "required": false
     },
     {
       "name": "field_inn_company",

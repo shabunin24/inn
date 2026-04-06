@@ -269,8 +269,11 @@ define(['jquery'], function ($) {
    */
   function resolveInnAndPatch(ctx, model, settings) {
     var leadFid = parseInt(String(settings.field_inn || '').trim(), 10);
-    var compFid = parseInt(String(settings.field_inn_company || '').trim(), 10) || leadFid;
-    if (!leadFid || !model) return { inn: '', patchMeta: null };
+    var compFidOnly = parseInt(String(settings.field_inn_company || '').trim(), 10);
+    var compFid = compFidOnly || leadFid;
+    if (!leadFid) leadFid = compFidOnly;
+    if (!compFid) compFid = leadFid;
+    if ((!leadFid && !compFid) || !model) return { inn: '', patchMeta: null };
 
     if (ctx.kind === 'companies') {
       var innC = extractInnFromCfv(model.get('custom_fields_values'), compFid);
@@ -301,8 +304,11 @@ define(['jquery'], function ($) {
   /** У карточки сделки в _embedded.companies часто нет custom_fields_values — только id. */
   function fetchCompanyInnFromAmoApi(self, model, settings, done) {
     var leadFid = parseInt(String(settings.field_inn || '').trim(), 10);
-    var compFid = parseInt(String(settings.field_inn_company || '').trim(), 10) || leadFid;
-    if (!leadFid || !hasAmoAuthorizedAjax(self)) {
+    var compFidOnly = parseInt(String(settings.field_inn_company || '').trim(), 10);
+    var compFid = compFidOnly || leadFid;
+    if (!leadFid) leadFid = compFidOnly;
+    if (!compFid) compFid = leadFid;
+    if ((!leadFid && !compFid) || !hasAmoAuthorizedAjax(self)) {
       done({ inn: '', patchMeta: null });
       return;
     }
@@ -729,29 +735,51 @@ define(['jquery'], function ($) {
       String(st.x_api_key || '').trim().length > 0;
     if (!hb || live.kind !== 'leads') return;
     var quick = resolveInnAndPatch(live, live.model, st);
-    if ((quick.inn.length === 10 || quick.inn.length === 12) && quick.inn !== self._innDadataLastProcessedInn) {
-      devTrace(self, st, 'сделка: ИНН из модели карточки → runPipeline', {
-        innLen: quick.inn.length,
-        hasPatchMeta: !!(quick.patchMeta && quick.patchMeta.kind),
-      });
-      runPipeline(self, st, live, quick.inn, false, quick.patchMeta);
-      return;
-    }
-    if (quick.inn.length !== 10 && quick.inn.length !== 12) {
-      if (quick.inn.length > 0) {
-        devTrace(self, st, 'ИНН из поля: длина не 10 и не 12 — runPipeline не вызываем, дальше webhook', {
-          innLen: quick.inn.length,
+    function continueHybrid(q) {
+      if ((q.inn.length === 10 || q.inn.length === 12) && q.inn !== self._innDadataLastProcessedInn) {
+        devTrace(self, st, 'сделка: ИНН → runPipeline', {
+          innLen: q.inn.length,
+          hasPatchMeta: !!(q.patchMeta && q.patchMeta.kind),
         });
+        runPipeline(self, st, live, q.inn, false, q.patchMeta);
+        return;
       }
-      self._innDadataLastProcessedInn = '';
-    } else if (quick.inn === self._innDadataLastProcessedInn) {
+      if (q.inn.length !== 10 && q.inn.length !== 12) {
+        if (q.inn.length > 0) {
+          devTrace(self, st, 'ИНН из поля: длина не 10 и не 12 — runPipeline не вызываем, дальше webhook', {
+            innLen: q.inn.length,
+          });
+        }
+        self._innDadataLastProcessedInn = '';
+      } else if (q.inn === self._innDadataLastProcessedInn) {
+        return;
+      }
+      devTrace(self, st, 'событие модели → webhook', { leadId: live.id });
+      requestServerLeadSync(self, st, live.id, function (ok, body) {
+        if (ok) showAutoMsgIfWebhookUpdated(self, body);
+        maybeRunClientAfterLeadWebhook(self, st, live, ok, body, false);
+      });
+    }
+    if ((quick.inn.length === 10 || quick.inn.length === 12) && quick.inn !== self._innDadataLastProcessedInn) {
+      continueHybrid(quick);
       return;
     }
-    devTrace(self, st, 'событие модели → webhook', { leadId: live.id });
-    requestServerLeadSync(self, st, live.id, function (ok, body) {
-      if (ok) showAutoMsgIfWebhookUpdated(self, body);
-      maybeRunClientAfterLeadWebhook(self, st, live, ok, body, false);
-    });
+    /* ИНН в блоке компании в UI часто не попадает в модель сделки до sync — подтягиваем lead?with=companies */
+    resolveInnForLeadCard(
+      self,
+      live.id,
+      st,
+      function (resolved) {
+        var r = resolved || { inn: '', patchMeta: null };
+        if ((r.inn.length === 10 || r.inn.length === 12) && r.inn !== self._innDadataLastProcessedInn) {
+          continueHybrid(r);
+          return;
+        }
+        continueHybrid(quick);
+      },
+      live,
+      live.model,
+    );
   }
 
   function runPipeline(self, settings, ctx, inn, fromButton, patchMeta) {
@@ -931,6 +959,8 @@ define(['jquery'], function ($) {
   function attachInnWatcher(self) {
     var settings = self.get_settings() || {};
     var innFid = parseInt(String(settings.field_inn || '').trim(), 10);
+    var compInnFid = parseInt(String(settings.field_inn_company || '').trim(), 10);
+    var innFieldAny = innFid || compInnFid;
     var hasBackend =
       String(settings.backend_url || '').trim().length > 0 &&
       String(settings.x_api_key || '').trim().length > 0;
@@ -976,8 +1006,8 @@ define(['jquery'], function ($) {
       return;
     }
 
-    if (ctx.kind === 'companies' && !innFid) return;
-    if (ctx.kind === 'leads' && !innFid && !hasBackend) return;
+    if (ctx.kind === 'companies' && !innFieldAny) return;
+    if (ctx.kind === 'leads' && !innFieldAny && !hasBackend) return;
 
     detachInnWatcher(self);
 
