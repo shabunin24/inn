@@ -193,55 +193,12 @@ define(['jquery'], function ($) {
   }
 
   /**
-   * JSON POST на бэкенд: сначала прямой fetch (CORS *), при сетевой ошибке — crm_post → fetch.
-   * Для /suggest-party, /company-by-inn, /integrations/amo/webhook из виджета.
+   * JSON POST на бэкенд (/suggest-party, /company-by-inn, /integrations/amo/webhook).
+   * В iframe amo прямой fetch до onrender.com часто не доходит (CSP connect-src и т.п.);
+   * фактический порядок — как в backendAmoProxyPost: crm_post → при сбое fetch.
    */
   function backendAmoJsonPostFetchFirst(self, settings, pathSuffix, jsonFields, onResult) {
-    var base = String(settings.backend_url || '').trim().replace(/\/+$/, '');
-    var key = String(settings.x_api_key || '').trim();
-    var url = base + pathSuffix;
-    if (!base || !key) {
-      onResult({ ok: false, status: 0, body: null, err: 'no_base_or_key' });
-      return;
-    }
-    function finish(ok, status, body, err) {
-      var badParse = body && body._parse_error;
-      onResult({
-        ok: ok && !badParse,
-        status: badParse ? 502 : status,
-        body: body,
-        err: badParse ? 'parse' : err,
-      });
-    }
-    if (typeof fetch !== 'function') {
-      backendAmoProxyPost(self, settings, pathSuffix, jsonFields, onResult);
-      return;
-    }
-    fetch(url, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'X-API-KEY': key,
-      },
-      body: JSON.stringify(jsonFields),
-      cache: 'no-store',
-      mode: 'cors',
-      credentials: 'omit',
-    })
-      .then(function (res) {
-        return res.text().then(function (text) {
-          var b = null;
-          try {
-            b = text ? JSON.parse(text) : null;
-          } catch (e) {
-            b = { _parse_error: true, raw: text };
-          }
-          finish(res.ok, res.status, b, res.ok ? null : 'http');
-        });
-      })
-      .catch(function () {
-        backendAmoProxyPost(self, settings, pathSuffix, jsonFields, onResult);
-      });
+    backendAmoProxyPost(self, settings, pathSuffix, jsonFields, onResult);
   }
 
   /** Стабильное сравнение карточки при переключении сделок (id в amo бывает string|number). */
@@ -794,6 +751,12 @@ define(['jquery'], function ($) {
     var key = String(settings.x_api_key || '').trim();
     var lid = parseInt(String(leadId), 10);
     if (!base || !key || isNaN(lid) || lid <= 0) {
+      if (isDeveloperMode(settings)) {
+        devTrace(self, settings, 'webhook пропуск: URL/ключ или lead_id (сохраните карточку сделки)', {
+          leadId: leadId,
+          parsedLeadId: lid,
+        });
+      }
       if (onDone) onDone(false, null);
       return;
     }
@@ -817,7 +780,7 @@ define(['jquery'], function ($) {
           updated_entity: body && body.updated_entity,
           lead_mirror_fields_updated: body && body.lead_mirror_fields_updated,
           innLen: body && body.inn ? String(body.inn).replace(/\D/g, '').length : 0,
-          transport: 'json_fetch_first_then_crm_post',
+          transport: 'crm_post_then_fetch',
           err: success ? undefined : r.err,
         });
         if (success && body.inn) {
@@ -1212,8 +1175,8 @@ define(['jquery'], function ($) {
           handleLeadCardHybridSync(self, live, st);
           return;
         }
-        var fid = parseInt(String(st.field_inn || '').trim(), 10);
-        if (!fid) return;
+        var idsW = settingsInnFieldIds(st);
+        if (!idsW.leadFid || idsW.leadFid <= 0) return;
         resolveInnForCard(self, live, st, function (resolved) {
           var inn = resolved.inn;
           devTrace(self, st, 'клиентский pipeline: ИНН', {
@@ -1257,9 +1220,19 @@ define(['jquery'], function ($) {
         handleLeadCardHybridSync(self, cc, st);
         return;
       }
+      if (cc.kind === 'companies') {
+        var idsCo = settingsInnFieldIds(st);
+        if (!idsCo.leadFid || idsCo.leadFid <= 0) return;
+        resolveInnForCard(self, cc, st, function (r) {
+          if (r.inn.length !== 10 && r.inn.length !== 12) return;
+          if (r.inn === self._innDadataLastProcessedInn) return;
+          runPipeline(self, st, cc, r.inn, false, r.patchMeta);
+        });
+        return;
+      }
       if (cc.kind !== 'leads') return;
-      var fid = parseInt(String(st.field_inn || '').trim(), 10);
-      if (!fid) return;
+      var idsP = settingsInnFieldIds(st);
+      if (!idsP.leadFid || idsP.leadFid <= 0) return;
       resolveInnForCard(self, cc, st, function (r) {
         if (r.inn.length !== 10 && r.inn.length !== 12) return;
         if (r.inn === self._innDadataLastProcessedInn) return;
@@ -1319,6 +1292,18 @@ define(['jquery'], function ($) {
             suggestState.timer = setTimeout(function () {
               runSuggestRequest(self, st, q, el);
             }, 260);
+          });
+        $(document)
+          .off('change.innDadataNativeInnSync blur.innDadataNativeInnSync')
+          .on('change.innDadataNativeInnSync blur.innDadataNativeInnSync', 'input, textarea', function () {
+            var el = this;
+            if ($(el).closest('.inn-dadata-widget').length) return;
+            if ($(el).hasClass('js-inn-dadata-input')) return;
+            var st = self.get_settings() || {};
+            if (!isInnFieldInput(st, el)) return;
+            if (typeof self._innDadataHandler === 'function') {
+              self._innDadataHandler();
+            }
           });
         $(window)
           .off('scroll.innDadataFloat resize.innDadataFloat')
@@ -1512,6 +1497,7 @@ define(['jquery'], function ($) {
         $(document).off('click.innDadata');
         $(document).off('input.innDadataSuggest');
         $(document).off('input.innDadataNativeInnSuggest');
+        $(document).off('change.innDadataNativeInnSync blur.innDadataNativeInnSync');
         $(window).off('scroll.innDadataFloat resize.innDadataFloat');
         $(document).off('mousedown.innDadataSuggestPick');
         $(document).off('click.innDadataSuggestClose');

@@ -890,7 +890,7 @@ async def root():
     """Проверка живости и что задеплоена актуальная main (есть ли suggest-party)."""
     return {
         "status": "ok",
-        "build": "suggest-party-v1",
+        "build": "suggest-party-v2-crm-post",
         "post": [
             "/company-by-inn",
             "/suggest-party",
