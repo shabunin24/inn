@@ -192,6 +192,59 @@ define(['jquery'], function ($) {
     runFetch();
   }
 
+  /**
+   * Подсказки /suggest-party: сначала прямой fetch на Render (CORS * на бэкенде).
+   * У части аккаунтов crm_post не доводит запрос до внешнего URL — подсказки «молчат».
+   * При сетевой ошибке / блокировке fetch — запасной путь как у остального API (crm_post → fetch).
+   */
+  function backendAmoSuggestPost(self, settings, pathSuffix, jsonFields, onResult) {
+    var base = String(settings.backend_url || '').trim().replace(/\/+$/, '');
+    var key = String(settings.x_api_key || '').trim();
+    var url = base + pathSuffix;
+    if (!base || !key) {
+      onResult({ ok: false, status: 0, body: null, err: 'no_base_or_key' });
+      return;
+    }
+    function finish(ok, status, body, err) {
+      var badParse = body && body._parse_error;
+      onResult({
+        ok: ok && !badParse,
+        status: badParse ? 502 : status,
+        body: body,
+        err: badParse ? 'parse' : err,
+      });
+    }
+    if (typeof fetch !== 'function') {
+      backendAmoProxyPost(self, settings, pathSuffix, jsonFields, onResult);
+      return;
+    }
+    fetch(url, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-API-KEY': key,
+      },
+      body: JSON.stringify(jsonFields),
+      cache: 'no-store',
+      mode: 'cors',
+      credentials: 'omit',
+    })
+      .then(function (res) {
+        return res.text().then(function (text) {
+          var b = null;
+          try {
+            b = text ? JSON.parse(text) : null;
+          } catch (e) {
+            b = { _parse_error: true, raw: text };
+          }
+          finish(res.ok, res.status, b, res.ok ? null : 'http');
+        });
+      })
+      .catch(function () {
+        backendAmoProxyPost(self, settings, pathSuffix, jsonFields, onResult);
+      });
+  }
+
   /** Стабильное сравнение карточки при переключении сделок (id в amo бывает string|number). */
   function cardContextKey(c) {
     return c && c.kind && c.id != null ? c.kind + ':' + String(c.id) : '';
@@ -615,7 +668,7 @@ define(['jquery'], function ($) {
     var Ls = function (k, fb) {
       return tr(self, k, fb);
     };
-    backendAmoProxyPost(self, settings, '/suggest-party', { query: q }, function (r) {
+    backendAmoSuggestPost(self, settings, '/suggest-party', { query: q }, function (r) {
       if (mySeq !== suggestState.seq) return;
       if (!r.ok) {
         hideSuggestDropdown();
@@ -648,19 +701,58 @@ define(['jquery'], function ($) {
     });
   }
 
+  function parseAmoFieldIdFromString(s) {
+    if (!s || typeof s !== 'string') return NaN;
+    var m = s.match(/(?:^|[^\d])(\d{5,12})(?:[^\d]|$)/);
+    if (!m) return NaN;
+    var n = parseInt(m[1], 10);
+    return !isNaN(n) && n > 0 ? n : NaN;
+  }
+
+  function readDomDataFieldId(node) {
+    if (!node || !node.getAttribute) return NaN;
+    var a =
+      node.getAttribute('data-id') ||
+      node.getAttribute('data-field-id') ||
+      node.getAttribute('data-field_id');
+    if (a != null && String(a).trim() !== '') {
+      var digits = String(a).replace(/\D/g, '');
+      if (digits.length >= 5) {
+        var n = parseInt(digits, 10);
+        if (!isNaN(n) && n > 0) return n;
+      }
+    }
+    return NaN;
+  }
+
   /**
-   * id доп. поля amo у контейнера строки формы (data-id / data-field-id в разных вёрстках).
+   * id доп. поля amo: предки с data-* (в т.ч. без jQuery .data), name/id инпута.
    */
   function amoNativeFieldIdFromInput(el) {
     if (!el || (el.tagName !== 'INPUT' && el.tagName !== 'TEXTAREA')) return NaN;
+    var p = el;
+    var d = 0;
+    for (d = 0; d < 16 && p; d++) {
+      var rid = readDomDataFieldId(p);
+      if (!isNaN(rid)) return rid;
+      p = p.parentElement;
+    }
+    var nm = el.getAttribute('name') || '';
+    var ida = el.getAttribute('id') || '';
+    var fromName = parseAmoFieldIdFromString(nm);
+    if (!isNaN(fromName)) return fromName;
+    var fromId = parseAmoFieldIdFromString(ida);
+    if (!isNaN(fromId)) return fromId;
     var $t = $(el);
     var $row = $t.closest(
-      '[data-id], [data-field-id], [data-field_id], .linked-form__field, .control--select',
+      '[data-id], [data-field-id], [data-field_id], .linked-form__field, .control--select, .js-linked-amo-form__field',
     );
     var i = 0;
     var v = null;
-    for (i = 0; i < 8 && $row.length; i++) {
+    for (i = 0; i < 10 && $row.length; i++) {
       try {
+        v = $row[0] && readDomDataFieldId($row[0]);
+        if (!isNaN(v)) return v;
         v = $row.data('id');
         if (v == null) v = $row.data('field-id');
         if (v == null) v = $row.data('field_id');
@@ -668,11 +760,11 @@ define(['jquery'], function ($) {
         v = null;
       }
       if (v != null && String(v).trim() !== '') {
-        var n = parseInt(String(v), 10);
-        if (!isNaN(n) && n > 0) return n;
+        var n2 = parseInt(String(v), 10);
+        if (!isNaN(n2) && n2 > 0) return n2;
       }
       $row = $row.parent().closest(
-        '[data-id], [data-field-id], [data-field_id], .linked-form__field, .js-linked-amo-form__field',
+        '[data-id], [data-field-id], [data-field_id], .linked-form__field, .js-linked-amo-form__field, [class*="custom-field"]',
       );
     }
     return NaN;
@@ -690,7 +782,8 @@ define(['jquery'], function ($) {
     var fid = amoNativeFieldIdFromInput(el);
     if (isNaN(fid)) return false;
     var ids = settingsInnFieldIds(settings);
-    return fid === ids.leadFid || fid === ids.compFid;
+    /* amo отдаёт id строкой в DOM — сравниваем нестрого */
+    return fid == ids.leadFid || fid == ids.compFid;
   }
 
   /**
