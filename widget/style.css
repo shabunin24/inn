@@ -35,6 +35,22 @@
   border-top: none;
   box-shadow: 0 4px 12px rgba(0, 0, 0, 0.12);
 }
+/* Подсказки под нативным полем ИНН в карточке amo (не только input виджета) */
+.inn-dadata-suggest--float {
+  position: fixed;
+  z-index: 2147483000;
+  display: none;
+  left: 0;
+  top: 0;
+  min-width: 220px;
+  max-width: 520px;
+  border: 1px solid #ccc;
+  border-radius: 0 0 4px 4px;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.18);
+}
+.inn-dadata-suggest--float.inn-dadata-suggest--open {
+  display: block;
+}
 .inn-dadata-suggest__item {
   padding: 8px 10px;
   cursor: pointer;

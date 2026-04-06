@@ -513,26 +513,44 @@ define(['jquery'], function ($) {
     return payload;
   }
 
-  var suggestState = { seq: 0, timer: null };
+  var suggestState = { seq: 0, timer: null, activeNativeInput: null };
 
   function hideSuggestDropdown() {
-    var $b = $('.js-inn-dadata-suggest');
-    $b.empty().hide();
+    $('.js-inn-dadata-suggest').empty().hide();
+    var $f = $('.js-inn-dadata-suggest-float');
+    $f.removeClass('inn-dadata-suggest--open').empty().hide();
+    suggestState.activeNativeInput = null;
   }
 
-  function renderSuggestDropdown(items) {
-    var $box = $('.js-inn-dadata-suggest');
-    if (!items || !items.length) {
-      $box.empty().hide();
-      return;
-    }
+  function getFloatSuggestUl() {
+    var $e = $('.js-inn-dadata-suggest-float');
+    if ($e.length) return $e;
+    return $(
+      '<ul class="inn-dadata-suggest inn-dadata-suggest--float js-inn-dadata-suggest-float" role="listbox" aria-hidden="true"></ul>',
+    ).appendTo('body');
+  }
+
+  function positionFloatSuggest(anchorEl) {
+    var $ul = $('.js-inn-dadata-suggest-float');
+    if (!anchorEl || !$ul.length) return;
+    var r = anchorEl.getBoundingClientRect();
+    var w = Math.max(r.width, 220);
+    /* position: fixed — координаты относительно вьюпорта */
+    $ul.css({
+      top: Math.round(r.bottom + 2) + 'px',
+      left: Math.round(r.left) + 'px',
+      width: Math.round(w) + 'px',
+    });
+  }
+
+  function buildSuggestItemsHtml(items) {
     var esc = function (s) {
       return String(s == null ? '' : s)
         .replace(/&/g, '&amp;')
         .replace(/</g, '&lt;')
         .replace(/"/g, '&quot;');
     };
-    var html = items
+    return (items || [])
       .map(function (it) {
         var inn = String(it.inn || '').replace(/\D/g, '');
         if (inn.length !== 10 && inn.length !== 12) return '';
@@ -547,14 +565,45 @@ define(['jquery'], function ($) {
         );
       })
       .join('');
-    if (!html) {
-      $box.empty().hide();
-      return;
-    }
-    $box.html(html).show();
   }
 
-  function runSuggestRequest(self, settings, q) {
+  function renderSuggestDropdown(items, anchorEl) {
+    var html = buildSuggestItemsHtml(items);
+    if (!html) {
+      hideSuggestDropdown();
+      return;
+    }
+    if (anchorEl && anchorEl.ownerDocument) {
+      $('.js-inn-dadata-suggest').empty().hide();
+      suggestState.activeNativeInput = anchorEl;
+      var $box = getFloatSuggestUl();
+      $box.html(html).addClass('inn-dadata-suggest--open').show();
+      positionFloatSuggest(anchorEl);
+      return;
+    }
+    suggestState.activeNativeInput = null;
+    $('.js-inn-dadata-suggest-float').removeClass('inn-dadata-suggest--open').empty().hide();
+    var $w = $('.js-inn-dadata-suggest');
+    $w.html(html).show();
+  }
+
+  function showSuggestError(self, hint) {
+    var $msg = $('.js-inn-dadata-msg');
+    if ($msg.length) {
+      $msg.text(hint);
+      setTimeout(function () {
+        $msg.text('');
+      }, 12000);
+      return;
+    }
+    try {
+      if (typeof console !== 'undefined' && console.warn) console.warn('[INN→DaData] подсказки:', hint);
+    } catch (e0) {
+      /* ignore */
+    }
+  }
+
+  function runSuggestRequest(self, settings, q, anchorEl) {
     if (!String(settings.backend_url || '').trim() || !String(settings.x_api_key || '').trim()) return;
     if (q.length < 2) {
       hideSuggestDropdown();
@@ -562,10 +611,10 @@ define(['jquery'], function ($) {
     }
     suggestState.seq += 1;
     var mySeq = suggestState.seq;
+    var anchorForRender = anchorEl || null;
     var Ls = function (k, fb) {
       return tr(self, k, fb);
     };
-    var $msg = $('.js-inn-dadata-msg');
     backendAmoProxyPost(self, settings, '/suggest-party', { query: q }, function (r) {
       if (mySeq !== suggestState.seq) return;
       if (!r.ok) {
@@ -590,15 +639,58 @@ define(['jquery'], function ($) {
         } else {
           hint = Ls('err_suggest', 'Подсказки недоступны') + ' (HTTP ' + r.status + ')';
         }
-        $msg.text(hint);
-        setTimeout(function () {
-          $msg.text('');
-        }, 12000);
+        showSuggestError(self, hint);
         return;
       }
-      $msg.text('');
-      renderSuggestDropdown((r.body && r.body.suggestions) || []);
+      var $msg = $('.js-inn-dadata-msg');
+      if ($msg.length) $msg.text('');
+      renderSuggestDropdown((r.body && r.body.suggestions) || [], anchorForRender);
     });
+  }
+
+  /**
+   * id доп. поля amo у контейнера строки формы (data-id / data-field-id в разных вёрстках).
+   */
+  function amoNativeFieldIdFromInput(el) {
+    if (!el || (el.tagName !== 'INPUT' && el.tagName !== 'TEXTAREA')) return NaN;
+    var $t = $(el);
+    var $row = $t.closest(
+      '[data-id], [data-field-id], [data-field_id], .linked-form__field, .control--select',
+    );
+    var i = 0;
+    var v = null;
+    for (i = 0; i < 8 && $row.length; i++) {
+      try {
+        v = $row.data('id');
+        if (v == null) v = $row.data('field-id');
+        if (v == null) v = $row.data('field_id');
+      } catch (eD) {
+        v = null;
+      }
+      if (v != null && String(v).trim() !== '') {
+        var n = parseInt(String(v), 10);
+        if (!isNaN(n) && n > 0) return n;
+      }
+      $row = $row.parent().closest(
+        '[data-id], [data-field-id], [data-field_id], .linked-form__field, .js-linked-amo-form__field',
+      );
+    }
+    return NaN;
+  }
+
+  function settingsInnFieldIds(settings) {
+    var leadFid = parseInt(String(settings.field_inn || '').trim(), 10);
+    var compOnly = parseInt(String(settings.field_inn_company || '').trim(), 10);
+    if (!leadFid) leadFid = compOnly;
+    var compFid = compOnly || leadFid;
+    return { leadFid: leadFid, compFid: compFid };
+  }
+
+  function isInnFieldInput(settings, el) {
+    var fid = amoNativeFieldIdFromInput(el);
+    if (isNaN(fid)) return false;
+    var ids = settingsInnFieldIds(settings);
+    return fid === ids.leadFid || fid === ids.compFid;
   }
 
   /**
@@ -1122,8 +1214,30 @@ define(['jquery'], function ($) {
             clearTimeout(suggestState.timer);
             suggestState.timer = setTimeout(function () {
               var st = self.get_settings() || {};
-              runSuggestRequest(self, st, q);
+              runSuggestRequest(self, st, q, null);
             }, 260);
+          });
+        $(document)
+          .off('input.innDadataNativeInnSuggest')
+          .on('input.innDadataNativeInnSuggest', 'input, textarea', function () {
+            var el = this;
+            if ($(el).closest('.inn-dadata-widget').length) return;
+            if ($(el).hasClass('js-inn-dadata-input')) return;
+            var st = self.get_settings() || {};
+            if (!String(st.backend_url || '').trim() || !String(st.x_api_key || '').trim()) return;
+            if (!isInnFieldInput(st, el)) return;
+            var q = String($(el).val() || '').trim();
+            clearTimeout(suggestState.timer);
+            suggestState.timer = setTimeout(function () {
+              runSuggestRequest(self, st, q, el);
+            }, 260);
+          });
+        $(window)
+          .off('scroll.innDadataFloat resize.innDadataFloat')
+          .on('scroll.innDadataFloat resize.innDadataFloat', function () {
+            if (suggestState.activeNativeInput && $('.js-inn-dadata-suggest-float').is(':visible')) {
+              positionFloatSuggest(suggestState.activeNativeInput);
+            }
           });
         $(document)
           .off('mousedown.innDadataSuggestPick')
@@ -1131,11 +1245,27 @@ define(['jquery'], function ($) {
             e.preventDefault();
             var inn = String($(this).data('inn') || '').replace(/\D/g, '');
             if (inn.length !== 10 && inn.length !== 12) return;
+            var nativeInp = suggestState.activeNativeInput;
             hideSuggestDropdown();
+            var st = self.get_settings() || {};
+            if (nativeInp && nativeInp.ownerDocument) {
+              try {
+                $(nativeInp).val(inn).trigger('input').trigger('change');
+              } catch (eVal) {
+                /* ignore */
+              }
+              setTimeout(function () {
+                var ctx = currentCardContext(self);
+                if (!ctx) return;
+                resolveInnForCard(self, ctx, st, function (res) {
+                  runPipeline(self, st, ctx, inn, false, res.patchMeta);
+                });
+              }, 80);
+              return;
+            }
             $('.js-inn-dadata-input').val('');
             var ctx = currentCardContext(self);
             if (!ctx) return;
-            var st = self.get_settings() || {};
             resolveInnForCard(self, ctx, st, function (res) {
               var pm = res.inn === inn ? res.patchMeta : null;
               runPipeline(self, st, ctx, inn, false, pm);
@@ -1145,6 +1275,7 @@ define(['jquery'], function ($) {
           .off('click.innDadataSuggestClose')
           .on('click.innDadataSuggestClose', function (e) {
             if ($(e.target).closest('.inn-dadata-widget__suggest-wrap').length) return;
+            if ($(e.target).closest('.js-inn-dadata-suggest-float').length) return;
             hideSuggestDropdown();
           });
         $(document)
@@ -1292,9 +1423,12 @@ define(['jquery'], function ($) {
       destroy: function () {
         $(document).off('click.innDadata');
         $(document).off('input.innDadataSuggest');
+        $(document).off('input.innDadataNativeInnSuggest');
+        $(window).off('scroll.innDadataFloat resize.innDadataFloat');
         $(document).off('mousedown.innDadataSuggestPick');
         $(document).off('click.innDadataSuggestClose');
         hideSuggestDropdown();
+        $('.js-inn-dadata-suggest-float').remove();
         detachInnWatcher(self);
         return true;
       },
